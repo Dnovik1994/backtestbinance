@@ -224,7 +224,7 @@ def simulate(row: Dict, df: pd.DataFrame, force_no_dca: bool = False) -> Dict[st
         )
 
     # ── Сценарий D: Широкий стоп 50% от объёма ───────────────
-    sl_wide_dist = (total_usdt * LEVERAGE * 0.5) / ((total_usdt * LEVERAGE) / entry)
+    sl_wide_dist = (total_usdt * 0.5) / ((total_usdt * LEVERAGE) / entry)
     sl_wide = (entry - sl_wide_dist) if side == "BUY" else (entry + sl_wide_dist)
     result_wide_sl = _sim_base(df, side, entry, tp_prices, sl_wide, total_usdt)
 
