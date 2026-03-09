@@ -14,6 +14,7 @@
 """
 
 import csv
+import os
 import time
 import json
 from datetime import datetime, timezone
@@ -56,12 +57,36 @@ BATCH_CANDLES = 1500  # максимум свечей за один запрос
 
 client = Client(API_KEY, API_SECRET)
 
+CANDLES_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "candles_cache")
+os.makedirs(CANDLES_CACHE_DIR, exist_ok=True)
+
 
 # ===========================
 # Утилиты
 # ===========================
+def _cache_path(symbol: str, start_ts_ms: int) -> str:
+    """Путь к кэш-файлу: candles_cache/{symbol}_{ts_ms}.csv.gz (ts округлён до минуты)."""
+    ts_rounded = (start_ts_ms // 60_000) * 60_000
+    return os.path.join(CANDLES_CACHE_DIR, f"{symbol}_{ts_rounded}.csv.gz")
+
+
 def get_klines_batch(symbol: str, start_ts_ms: int, limit: int = BATCH_CANDLES) -> pd.DataFrame:
-    """Загружает один батч минутных свечей."""
+    """Загружает один батч минутных свечей (с кэшированием)."""
+    cache_file = _cache_path(symbol, start_ts_ms)
+
+    # Проверяем кэш
+    if os.path.exists(cache_file):
+        try:
+            df = pd.read_csv(cache_file, compression="gzip")
+            df["open_time"] = pd.to_datetime(df["open_time"], utc=True)
+            for col in ["open", "high", "low", "close"]:
+                df[col] = df[col].astype(float)
+            print(f"  [cache] {symbol} loaded from {os.path.basename(cache_file)}")
+            return df
+        except Exception as e:
+            print(f"  [!] cache read error {cache_file}: {e}")
+
+    # Скачиваем с Binance
     try:
         raw = client.futures_klines(
             symbol=symbol,
@@ -83,6 +108,14 @@ def get_klines_batch(symbol: str, start_ts_ms: int, limit: int = BATCH_CANDLES) 
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
     for col in ["open", "high", "low", "close"]:
         df[col] = df[col].astype(float)
+
+    # Сохраняем в кэш
+    try:
+        df.to_csv(cache_file, index=False, compression="gzip")
+        print(f"  [cache] {symbol} saved to {os.path.basename(cache_file)}")
+    except Exception as e:
+        print(f"  [!] cache write error: {e}")
+
     return df
 
 
