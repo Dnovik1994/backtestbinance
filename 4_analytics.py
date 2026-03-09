@@ -231,6 +231,9 @@ def simulate(row: Dict, df: pd.DataFrame, force_no_dca: bool = False) -> Dict[st
     # ── Сценарий E: 48-часовое управление ─────────────────────
     result_48h = _sim_48h(df, side, entry, tp_prices, sl, total_usdt)
 
+    # ── Сценарий F: Широкий стоп + веса 70/20/10 + троллинг -15% ROI ──
+    result_f = _sim_f(df, side, entry, tp_prices, sl_wide, total_usdt)
+
     # ── Блок вероятности направления ─────────────────────────
     direction_prob = _calc_direction_prob(df, side, DIRECTION_HORIZONS)
 
@@ -254,6 +257,9 @@ def simulate(row: Dict, df: pd.DataFrame, force_no_dca: bool = False) -> Dict[st
 
         # Сценарий E
         "48h":            result_48h,
+
+        # Сценарий F
+        "f":              result_f,
 
         # Вероятность направления
         "direction":      direction_prob,
@@ -397,6 +403,76 @@ def _sim_trailing_custom(df, side, entry, tp_prices, sl_orig, sl_after_tp1, tota
     outcome     = "TIMEOUT"
     close_price = None
     candles     = 0
+
+    for _, row in df.iterrows():
+        candles += 1
+        high, low = row["high"], row["low"]
+
+        while tps_hit < n:
+            tp = tp_prices[tps_hit]
+            if (side == "BUY" and high >= tp) or (side == "SELL" and low <= tp):
+                w = weights[tps_hit]
+                realized    += pnl_usdt(entry, tp, side, total_usdt * w)
+                remaining_w -= w
+                tps_hit     += 1
+
+                if tps_hit == 1:
+                    current_sl = sl_after_tp1
+                elif tps_hit == 2 and len(tp_prices) >= 1:
+                    current_sl = tp_prices[0]
+            else:
+                break
+
+        if (side == "BUY" and low <= current_sl) or (side == "SELL" and high >= current_sl):
+            realized    += pnl_usdt(entry, current_sl, side, total_usdt * remaining_w)
+            remaining_w  = 0.0
+            outcome      = f"SL_after_TP{tps_hit}" if tps_hit > 0 else "SL"
+            close_price  = current_sl
+            break
+
+        if tps_hit == n and remaining_w <= 0.001:
+            outcome     = f"TP{n}"
+            close_price = tp_prices[-1]
+            break
+
+    if outcome == "TIMEOUT" and remaining_w > 0.001:
+        last = float(df.iloc[-1]["close"])
+        realized   += pnl_usdt(entry, last, side, total_usdt * remaining_w)
+        close_price = last
+        if tps_hit > 0:
+            outcome = f"TP{tps_hit}_TIMEOUT"
+
+    return {
+        "outcome":    outcome,
+        "tps_hit":    tps_hit,
+        "pnl":        round(realized, 4),
+        "roi":        round(roi_pct(realized, total_usdt), 2),
+        "candles":    candles,
+        "close_price": close_price,
+    }
+
+
+def _sim_f(df, side, entry, tp_prices, sl_wide, total_usdt):
+    """
+    Сценарий F — широкий стоп (D) + веса 70/20/10 + троллинг -15% ROI после TP1.
+      Веса TP: 70% / 20% / 10%
+      После TP1 → SL на -15% ROI от entry
+      После TP2 → SL на TP1
+    """
+    F_WEIGHTS = [0.7, 0.2, 0.1]
+    n       = len(tp_prices)
+    weights = _norm_weights(F_WEIGHTS, n)
+
+    realized    = 0.0
+    remaining_w = 1.0
+    tps_hit     = 0
+    current_sl  = sl_wide
+    outcome     = "TIMEOUT"
+    close_price = None
+    candles     = 0
+
+    # SL после TP1: -15% ROI от entry
+    sl_after_tp1 = entry * (1 - 0.15 / LEVERAGE) if side == "BUY" else entry * (1 + 0.15 / LEVERAGE)
 
     for _, row in df.iterrows():
         candles += 1
@@ -642,6 +718,7 @@ def _empty_result(reason: str = "NO_DATA"):
         "base": base, "trail": base,
         "wide_sl": base,
         "48h": base,
+        "f": base,
         "direction": {f"dir_{h}m": None for h in DIRECTION_HORIZONS},
     }
     for pct in SL_AFTER_TP1_VARIANTS:
@@ -729,27 +806,38 @@ def main():
 
             # Сценарий C: SL после TP1 -5%/-10%/-15%
             "C5_outcome":   sim["sl_after_tp1_5pct"]["outcome"],
+            "C5_tps_hit":   sim["sl_after_tp1_5pct"]["tps_hit"],
             "C5_pnl":       sim["sl_after_tp1_5pct"]["pnl"],
             "C5_roi":       sim["sl_after_tp1_5pct"]["roi"],
 
             "C10_outcome":  sim["sl_after_tp1_10pct"]["outcome"],
+            "C10_tps_hit":  sim["sl_after_tp1_10pct"]["tps_hit"],
             "C10_pnl":      sim["sl_after_tp1_10pct"]["pnl"],
             "C10_roi":      sim["sl_after_tp1_10pct"]["roi"],
 
             "C15_outcome":  sim["sl_after_tp1_15pct"]["outcome"],
+            "C15_tps_hit":  sim["sl_after_tp1_15pct"]["tps_hit"],
             "C15_pnl":      sim["sl_after_tp1_15pct"]["pnl"],
             "C15_roi":      sim["sl_after_tp1_15pct"]["roi"],
 
             # Сценарий D: Широкий стоп 50%
             "D_outcome":    sim["wide_sl"]["outcome"],
+            "D_tps_hit":    sim["wide_sl"]["tps_hit"],
             "D_pnl":        sim["wide_sl"]["pnl"],
             "D_roi":        sim["wide_sl"]["roi"],
 
             # Сценарий E: 48-часовое управление
             "E_outcome":    sim["48h"]["outcome"],
+            "E_tps_hit":    sim["48h"]["tps_hit"],
             "E_pnl":        sim["48h"]["pnl"],
             "E_roi":        sim["48h"]["roi"],
             "E_candles":    sim["48h"]["candles"],
+
+            # Сценарий F: Широкий стоп + веса 70/20/10 + троллинг -15% ROI
+            "F_outcome":    sim["f"]["outcome"],
+            "F_tps_hit":    sim["f"]["tps_hit"],
+            "F_pnl":        sim["f"]["pnl"],
+            "F_roi":        sim["f"]["roi"],
 
             # Вероятность направления
             "dir_5m":       sim["direction"].get("dir_5m"),
@@ -770,25 +858,35 @@ def main():
             "ND_B_roi":        sim_nd["trail"]["roi"],
 
             "ND_C5_outcome":   sim_nd["sl_after_tp1_5pct"]["outcome"],
+            "ND_C5_tps_hit":   sim_nd["sl_after_tp1_5pct"]["tps_hit"],
             "ND_C5_pnl":       sim_nd["sl_after_tp1_5pct"]["pnl"],
             "ND_C5_roi":       sim_nd["sl_after_tp1_5pct"]["roi"],
 
             "ND_C10_outcome":  sim_nd["sl_after_tp1_10pct"]["outcome"],
+            "ND_C10_tps_hit":  sim_nd["sl_after_tp1_10pct"]["tps_hit"],
             "ND_C10_pnl":      sim_nd["sl_after_tp1_10pct"]["pnl"],
             "ND_C10_roi":      sim_nd["sl_after_tp1_10pct"]["roi"],
 
             "ND_C15_outcome":  sim_nd["sl_after_tp1_15pct"]["outcome"],
+            "ND_C15_tps_hit":  sim_nd["sl_after_tp1_15pct"]["tps_hit"],
             "ND_C15_pnl":      sim_nd["sl_after_tp1_15pct"]["pnl"],
             "ND_C15_roi":      sim_nd["sl_after_tp1_15pct"]["roi"],
 
             "ND_D_outcome":    sim_nd["wide_sl"]["outcome"],
+            "ND_D_tps_hit":    sim_nd["wide_sl"]["tps_hit"],
             "ND_D_pnl":        sim_nd["wide_sl"]["pnl"],
             "ND_D_roi":        sim_nd["wide_sl"]["roi"],
 
             "ND_E_outcome":    sim_nd["48h"]["outcome"],
+            "ND_E_tps_hit":    sim_nd["48h"]["tps_hit"],
             "ND_E_pnl":        sim_nd["48h"]["pnl"],
             "ND_E_roi":        sim_nd["48h"]["roi"],
             "ND_E_candles":    sim_nd["48h"]["candles"],
+
+            "ND_F_outcome":    sim_nd["f"]["outcome"],
+            "ND_F_tps_hit":    sim_nd["f"]["tps_hit"],
+            "ND_F_pnl":        sim_nd["f"]["pnl"],
+            "ND_F_roi":        sim_nd["f"]["roi"],
         }
         results.append(row)
         time.sleep(0.25)
@@ -889,6 +987,15 @@ def main():
         # Разбивка по исходам
         outcomes = sub[f"{col_prefix}_outcome"].value_counts().to_dict()
         report.append("  Исходы: " + " | ".join(f"{k}: {v}" for k, v in sorted(outcomes.items())))
+
+        # Разбивка по TP (если есть колонка tps_hit)
+        tps_col = f"{col_prefix}_tps_hit"
+        if tps_col in src.columns:
+            tp1_count = (sub[tps_col] >= 1).sum()
+            tp2_count = (sub[tps_col] >= 2).sum()
+            tp3_count = (sub[tps_col] >= 3).sum()
+            report.append(f"  TP достижения: TP1: {tp1_count} | TP2: {tp2_count} | TP3: {tp3_count}")
+
         report.append("")
 
     scenario_stats("A", "A) Базовый (без троллинга стопа)")
@@ -898,6 +1005,7 @@ def main():
     scenario_stats("C15", "C) SL после TP1: ROI -15%")
     scenario_stats("D",  "D) Широкий стоп 50% от объёма позиции")
     scenario_stats("E",  "E) 48ч управление (троллинг + динамический SL)")
+    scenario_stats("F",  "F) D+C15 (широкий стоп, 70/20/10, троллинг -15% ROI)")
 
     # ── Статистика без усреднения (ND_* колонки) ──────────────
     report.append("═" * 60)
@@ -912,6 +1020,7 @@ def main():
     scenario_stats("ND_C15", "C) SL после TP1: ROI -15%")
     scenario_stats("ND_D",   "D) Широкий стоп 50% от объёма позиции")
     scenario_stats("ND_E",   "E) 48ч управление (троллинг + динамический SL)")
+    scenario_stats("ND_F",   "F) D+C15 (широкий стоп, 70/20/10, троллинг -15% ROI)")
 
     # Зависимости
     report.append("── Зависимость: размер стопа vs результат ─────────────")
@@ -1007,6 +1116,7 @@ SCENARIOS = {
     "C15": {"label": "C15 · SL-15%",   "color": "#ef4444", "width": 1.5},
     "D":   {"label": "D · фикс.стоп",  "color": "#10b981", "width": 2.5},
     "E":   {"label": "E · 48ч",        "color": "#a855f7", "width": 2.0},
+    "F":   {"label": "F · D+C15",     "color": "#f97316", "width": 2.0},
 }
 
 ND_SCENARIOS = {
@@ -1017,6 +1127,7 @@ ND_SCENARIOS = {
     "ND_C15": {"label": "C15 · SL-15%",   "color": "#ef4444", "width": 1.5},
     "ND_D":   {"label": "D · фикс.стоп",  "color": "#10b981", "width": 2.5},
     "ND_E":   {"label": "E · 48ч",        "color": "#a855f7", "width": 2.0},
+    "ND_F":   {"label": "F · D+C15",     "color": "#f97316", "width": 2.0},
 }
 
 def _pnl_col(scen):
