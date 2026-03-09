@@ -213,6 +213,14 @@ def simulate(row: Dict, df: pd.DataFrame, force_no_dca: bool = False) -> Dict[st
     # ── Сценарий A: Базовый (без троллинга) ──────────────────
     result_base = _sim_base(df, side, entry, tp_prices, sl, total_usdt)
 
+    # ── Сценарий A_20: Базовый, SL = фикс. -20% ROI ──────
+    sl_a20 = entry * (1 - 0.20 / LEVERAGE) if side == "BUY" else entry * (1 + 0.20 / LEVERAGE)
+    result_a20 = _sim_base(df, side, entry, tp_prices, sl_a20, total_usdt)
+
+    # ── Сценарий A_30: Базовый, SL = фикс. -30% ROI ──────
+    sl_a30 = entry * (1 - 0.30 / LEVERAGE) if side == "BUY" else entry * (1 + 0.30 / LEVERAGE)
+    result_a30 = _sim_base(df, side, entry, tp_prices, sl_a30, total_usdt)
+
     # ── Сценарий B: Троллинг стопа (после TP1 → в б/у, после TP2 → TP1) ──
     result_trail = _sim_trailing(df, side, entry, tp_prices, sl, total_usdt)
 
@@ -358,6 +366,12 @@ def simulate(row: Dict, df: pd.DataFrame, force_no_dca: bool = False) -> Dict[st
 
         # Сценарий A
         "base":           result_base,
+
+        # Сценарий A_20
+        "a20":            result_a20,
+
+        # Сценарий A_30
+        "a30":            result_a30,
 
         # Сценарий B
         "trail":          result_trail,
@@ -1138,7 +1152,7 @@ def _empty_result(reason: str = "NO_DATA"):
     result = {
         "total_usdt": POSITION_USDT, "has_dca": False,
         "tp_prices": [], "sl": None,
-        "base": base, "trail": base,
+        "base": base, "a20": base, "a30": base, "trail": base,
         "wide_sl": base,
         "48h": base,
         "24h": base,
@@ -1254,6 +1268,20 @@ def main():
                 "A_pnl":        sim["base"]["pnl"],
                 "A_roi":        sim["base"]["roi"],
                 "A_candles":    sim["base"]["candles"],
+
+                # Сценарий A20: фикс.стоп -20% ROI
+                "A20_outcome":  sim["a20"]["outcome"],
+                "A20_tps_hit":  sim["a20"]["tps_hit"],
+                "A20_pnl":      sim["a20"]["pnl"],
+                "A20_roi":      sim["a20"]["roi"],
+                "A20_candles":  sim["a20"]["candles"],
+
+                # Сценарий A30: фикс.стоп -30% ROI
+                "A30_outcome":  sim["a30"]["outcome"],
+                "A30_tps_hit":  sim["a30"]["tps_hit"],
+                "A30_pnl":      sim["a30"]["pnl"],
+                "A30_roi":      sim["a30"]["roi"],
+                "A30_candles":  sim["a30"]["candles"],
 
                 # Сценарий B: Троллинг стопа
                 "B_outcome":    sim["trail"]["outcome"],
@@ -1406,6 +1434,18 @@ def main():
                 "ND_A_pnl":        sim_nd["base"]["pnl"],
                 "ND_A_roi":        sim_nd["base"]["roi"],
                 "ND_A_candles":    sim_nd["base"]["candles"],
+
+                "ND_A20_outcome":  sim_nd["a20"]["outcome"],
+                "ND_A20_tps_hit":  sim_nd["a20"]["tps_hit"],
+                "ND_A20_pnl":      sim_nd["a20"]["pnl"],
+                "ND_A20_roi":      sim_nd["a20"]["roi"],
+                "ND_A20_candles":  sim_nd["a20"]["candles"],
+
+                "ND_A30_outcome":  sim_nd["a30"]["outcome"],
+                "ND_A30_tps_hit":  sim_nd["a30"]["tps_hit"],
+                "ND_A30_pnl":      sim_nd["a30"]["pnl"],
+                "ND_A30_roi":      sim_nd["a30"]["roi"],
+                "ND_A30_candles":  sim_nd["a30"]["candles"],
 
                 "ND_B_outcome":    sim_nd["trail"]["outcome"],
                 "ND_B_tps_hit":    sim_nd["trail"]["tps_hit"],
@@ -1694,6 +1734,8 @@ def main():
         report.append("")
 
     scenario_stats("A", "A) Базовый (без троллинга стопа)")
+    scenario_stats("A20", "A20) Базовый, фикс.стоп -20% ROI")
+    scenario_stats("A30", "A30) Базовый, фикс.стоп -30% ROI")
     scenario_stats("B", "B) Троллинг стопа (б/у после TP1, TP1 после TP2)")
     scenario_stats("C5",  "C) SL после TP1: ROI -5%")
     scenario_stats("C10", "C) SL после TP1: ROI -10%")
@@ -1734,6 +1776,8 @@ def main():
     report.append("")
 
     scenario_stats("ND_A",   "A) Базовый (без троллинга стопа)")
+    scenario_stats("ND_A20", "A20) Базовый, фикс.стоп -20% ROI")
+    scenario_stats("ND_A30", "A30) Базовый, фикс.стоп -30% ROI")
     scenario_stats("ND_B",   "B) Троллинг стопа (б/у после TP1, TP1 после TP2)")
     scenario_stats("ND_C5",  "C) SL после TP1: ROI -5%")
     scenario_stats("ND_C10", "C) SL после TP1: ROI -10%")
@@ -1855,6 +1899,8 @@ INITIAL_BALANCE = 4000.0
 
 SCENARIOS = {
     "A":   {"label": "A · базовый",    "color": "#3b82f6", "width": 1.5},
+    "A20": {"label": "A20 · фикс.стоп -20%ROI", "color": "#6366f1", "width": 1.5},
+    "A30": {"label": "A30 · фикс.стоп -30%ROI", "color": "#ec4899", "width": 1.5},
     "B":   {"label": "B · троллинг",   "color": "#f59e0b", "width": 1.5},
     "C5":  {"label": "C5 · SL-5%",     "color": "#06b6d4", "width": 1.5},
     "C10": {"label": "C10 · SL-10%",   "color": "#f97316", "width": 1.5},
@@ -1885,6 +1931,8 @@ SCENARIOS = {
 
 ND_SCENARIOS = {
     "ND_A":   {"label": "A · базовый",    "color": "#3b82f6", "width": 1.5},
+    "ND_A20": {"label": "A20 · фикс.стоп -20%ROI", "color": "#6366f1", "width": 1.5},
+    "ND_A30": {"label": "A30 · фикс.стоп -30%ROI", "color": "#ec4899", "width": 1.5},
     "ND_B":   {"label": "B · троллинг",   "color": "#f59e0b", "width": 1.5},
     "ND_C5":  {"label": "C5 · SL-5%",     "color": "#06b6d4", "width": 1.5},
     "ND_C10": {"label": "C10 · SL-10%",   "color": "#f97316", "width": 1.5},
