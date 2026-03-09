@@ -451,23 +451,40 @@ MAX_48H_CANDLES = 48 * 60  # 2880 минутных свечей = 48 часов
 
 def _sim_48h(df, side, entry, tp_prices, sl_orig, total_usdt):
     """
-    Сценарий E: 48-часовое управление с динамическим SL.
-    Троллинг стопа (как сценарий B) + динамический SL по глубине убытка +
-    временные правила (36ч/42ч/48ч) + отслеживание ликвидации.
+    Сценарий E — 48-часовая симуляция с динамическим управлением стоп-лоссом.
+
+    Логика: позиция открывается и удерживается до 48 часов (2880 минутных свечей).
+    Тейк-профиты (TP1–TP3) снимаются последовательно с весами из TP_WEIGHTS.
+    После первого TP стоп-лосс фиксируется и подтягивается (троллинг-стоп):
+    TP1 → SL на точку входа (б/у), TP2 → SL на уровень TP1.
+    До первого TP используется динамический SL, зависящий от текущей глубины
+    убытка (ROI): чем глубже просадка, тем шире стоп (или стоп снимается совсем).
+    Временные правила: после 36ч закрываем слабый профит (1–1.5%) и сильный
+    убыток (≤−10%); после 42ч закрываем позиции с ROI от −10% до −15% по цене
+    entry−1%. По истечении 48ч — принудительное закрытие. Ликвидация отслеживается
+    отдельно: если цена доходила до порога ликвидации и исход не TP — PnL = −100%.
     """
+
+    # ── Инициализация параметров ──────────────────────────────────────────
+    # n — количество тейк-профитов; weights — нормализованные доли позиции для каждого TP
     n       = len(tp_prices)
     weights = _norm_weights(TP_WEIGHTS, n)
 
-    realized    = 0.0
-    remaining_w = 1.0
-    tps_hit     = 0
-    outcome     = "E_timeout_48h"
-    close_price = None
-    candles     = 0
-    liquidation_at_candle = None
-    sl_locked   = False  # SL фиксируется после TP1 (троллинг)
+    realized    = 0.0    # накопленный реализованный PnL в USDT
+    remaining_w = 1.0    # оставшаяся доля позиции (1.0 = 100%)
+    tps_hit     = 0      # счётчик сработавших тейк-профитов
+    outcome     = "E_timeout_48h"  # исход по умолчанию — таймаут 48ч
+    close_price = None   # цена, по которой позиция была закрыта
+    candles     = 0      # счётчик обработанных свечей
+    liquidation_at_candle = None  # номер свечи, на которой произошла ликвидация (если была)
+    # sl_locked — флаг: после первого TP стоп-лосс переключается в режим троллинга
+    # и больше не пересчитывается динамически
+    sl_locked   = False
 
-    # Порог ликвидации: цена, при которой убыток >= 100% от total_usdt
+    # ── Расчёт порога ликвидации ──────────────────────────────────────────
+    # При плече LEVERAGE ликвидация наступает, когда убыток съедает 100% маржи.
+    # qty — размер позиции в монетах; liq_dist — расстояние в цене от entry до ликвидации.
+    # Для BUY ликвидация ниже entry, для SELL — выше.
     qty = (total_usdt * LEVERAGE) / entry
     liq_dist = total_usdt / qty  # ценовое расстояние до ликвидации
     if side == "BUY":
@@ -475,18 +492,35 @@ def _sim_48h(df, side, entry, tp_prices, sl_orig, total_usdt):
     else:
         liq_price = entry + liq_dist
 
+    # ── Основной цикл по свечам ──────────────────────────────────────────
     for _, row in df.iterrows():
         candles += 1
+
+        # Ограничение: не обрабатываем больше 48 часов (MAX_48H_CANDLES = 2880 свечей)
         if candles > MAX_48H_CANDLES:
             break
         high, low, close = row["high"], row["low"], float(row["close"])
 
-        # --- Проверяем ликвидацию (фиксируем момент, но не останавливаем) ---
+        # ── Блок 1: Проверка ликвидации ──────────────────────────────────
+        # Проверяем, достигла ли цена порога ликвидации на этой свече.
+        # Если ликвидация уже была зафиксирована ранее — пропускаем.
+        # Важно: мы только ЗАПОМИНАЕМ факт ликвидации, но не прерываем цикл —
+        # потому что нужно проверить, не сработал ли TP раньше ликвидации.
+        # Итог: liquidation_at_candle будет использован в финальной проверке.
         if liquidation_at_candle is None:
             if (side == "BUY" and low <= liq_price) or (side == "SELL" and high >= liq_price):
                 liquidation_at_candle = candles
 
-        # --- Проверяем TP (троллинг как в сценарии B) ---
+        # ── Блок 2: Последовательное снятие тейк-профитов (троллинг) ─────
+        # while-цикл позволяет снять несколько TP за одну свечу (если цена
+        # прошла через несколько уровней сразу).
+        # Для BUY проверяем high >= TP (цена дошла вверх), для SELL — low <= TP.
+        # При срабатывании TP:
+        #   — фиксируем прибыль по доле w от позиции
+        #   — уменьшаем оставшуюся долю remaining_w
+        #   — включаем sl_locked (переход на троллинг-стоп)
+        #   — подтягиваем SL: после TP1 → SL на entry (безубыток),
+        #     после TP2 → SL на уровень TP1 (фиксируем часть прибыли)
         while tps_hit < n:
             tp = tp_prices[tps_hit]
             if (side == "BUY" and high >= tp) or (side == "SELL" and low <= tp):
@@ -496,7 +530,9 @@ def _sim_48h(df, side, entry, tp_prices, sl_orig, total_usdt):
                 tps_hit     += 1
                 sl_locked    = True
 
-                # Двигаем SL (троллинг)
+                # Двигаем SL (троллинг-стоп):
+                # После TP1 — стоп на entry (безубыток, защита от разворота)
+                # После TP2 — стоп на TP1 (гарантируем прибыль по первому уровню)
                 if tps_hit == 1:
                     current_sl_trailing = entry          # б/у
                 elif tps_hit == 2 and len(tp_prices) >= 1:
@@ -504,32 +540,45 @@ def _sim_48h(df, side, entry, tp_prices, sl_orig, total_usdt):
             else:
                 break
 
-        # Все TP взяты
+        # ── Блок 3: Проверка полного закрытия по TP ──────────────────────
+        # Если все тейк-профиты сработали и позиция практически пуста
+        # (remaining_w < 0.001 — защита от погрешности float),
+        # выставляем исход "TPn" и выходим из цикла.
         if tps_hit == n and remaining_w <= 0.001:
             outcome     = f"TP{n}"
             close_price = tp_prices[-1]
             break
 
-        # --- Динамический SL (пока не зафиксирован троллингом) ---
+        # ── Блок 4: Динамический SL (до первого TP) ──────────────────────
+        # Пока не сработал ни один TP (sl_locked=False), SL рассчитывается
+        # динамически в зависимости от текущего ROI (глубины просадки).
+        # Логика: чем глубже убыток, тем шире стоп, чтобы дать позиции
+        # пространство для восстановления:
+        #   ROI < −40%  → SL снимается полностью (ждём до 48ч, не режем)
+        #   ROI < −30%  → SL = entry ± 41% (очень широкий стоп)
+        #   ROI < −20%  → SL = entry ± 31% (средний стоп)
+        #   ROI ≥ −20%  → SL = entry ± 21% (стандартный стоп)
+        # Знак ± зависит от направления: BUY — минус, SELL — плюс.
+        # После первого TP переключаемся на троллинг-стоп (else-ветка).
         if not sl_locked:
             current_roi = roi_pct(pnl_usdt(entry, close, side, total_usdt), total_usdt)
             if current_roi < -40:
-                # Не ставим SL, ждём 48ч
+                # Глубокая просадка (>40%) — SL не ставим, ждём таймаут 48ч
                 current_sl_dynamic = None
             elif current_roi < -30:
-                # SL = entry ± 41%
+                # Просадка 30–40% — очень широкий стоп (41% от entry)
                 if side == "BUY":
                     current_sl_dynamic = entry * (1 - 0.41)
                 else:
                     current_sl_dynamic = entry * (1 + 0.41)
             elif current_roi < -20:
-                # SL = entry ± 31%
+                # Просадка 20–30% — средний стоп (31% от entry)
                 if side == "BUY":
                     current_sl_dynamic = entry * (1 - 0.31)
                 else:
                     current_sl_dynamic = entry * (1 + 0.31)
             else:
-                # ROI от 0% до -20% → SL = entry ± 21%
+                # Просадка < 20% или позиция в плюсе — стандартный стоп (21% от entry)
                 if side == "BUY":
                     current_sl_dynamic = entry * (1 - 0.21)
                 else:
@@ -537,9 +586,16 @@ def _sim_48h(df, side, entry, tp_prices, sl_orig, total_usdt):
 
             active_sl = current_sl_dynamic
         else:
+            # После срабатывания TP — используем троллинг-стоп (подтянутый SL)
             active_sl = current_sl_trailing
 
-        # --- Проверяем SL ---
+        # ── Блок 5: Проверка срабатывания стоп-лосса ─────────────────────
+        # Если active_sl задан (не None — может быть None при ROI < −40%),
+        # проверяем, пробила ли свеча уровень стопа.
+        # При срабатывании: закрываем всю оставшуюся долю по цене SL.
+        # Исход:
+        #   sl_locked=True  → "E_SL_after_TPn" (стоп после частичного профита)
+        #   sl_locked=False → "E_SL" (стоп без единого TP)
         if active_sl is not None:
             if (side == "BUY" and low <= active_sl) or (side == "SELL" and high >= active_sl):
                 realized    += pnl_usdt(entry, active_sl, side, total_usdt * remaining_w)
@@ -551,31 +607,42 @@ def _sim_48h(df, side, entry, tp_prices, sl_orig, total_usdt):
                 close_price  = active_sl
                 break
 
-        # --- Временные правила (свеча >= 2160 = 36ч) ---
+        # ── Блок 6: Временные правила (36ч / 42ч) ────────────────────────
+        # Применяются только если позиция ещё открыта (remaining_w > 0.001).
+        # Свечи минутные, поэтому: 2160 свечей = 36ч, 2520 свечей = 42ч.
         if remaining_w > 0.001:
             current_roi_now = roi_pct(pnl_usdt(entry, close, side, total_usdt), total_usdt)
 
+            # Правило 36ч (candles >= 2160):
             if candles >= 2160:
-                # ROI от 1% до 1.5% → закрыть
+                # Если ROI в диапазоне 1%–1.5% — слабый профит, который может
+                # исчезнуть. Закрываем позицию сейчас, чтобы зафиксировать.
+                # Исход: "E_close_36_48h" — закрытие по временному правилу.
                 if 1.0 <= current_roi_now <= 1.5:
                     realized    += pnl_usdt(entry, close, side, total_usdt * remaining_w)
                     remaining_w  = 0.0
                     outcome      = "E_close_36_48h"
                     close_price  = close
                     break
-                # ROI отрицательный и <= -10% → закрыть немедленно
+                # Если ROI ≤ −10% — сильный убыток, дальше держать бессмысленно.
+                # Закрываем немедленно по текущей цене.
+                # Исход: "E_close_minus10pct" — аварийное закрытие по убытку.
                 elif current_roi_now <= -10:
                     realized    += pnl_usdt(entry, close, side, total_usdt * remaining_w)
                     remaining_w  = 0.0
                     outcome      = "E_close_minus10pct"
                     close_price  = close
                     break
-                # ROI > 1.7% → продолжать до 48ч (ничего не делаем)
+                # Если ROI > 1.7% — позиция в хорошем профите, продолжаем
+                # держать до 48ч (ничего не делаем, пропускаем)
 
+            # Правило 42ч (candles >= 2520):
+            # Если ROI в диапазоне от −15% до −10% — умеренный убыток.
+            # Закрываем не по рынку, а по расчётной цене entry −1% (для BUY)
+            # или entry +1% (для SELL), чтобы ограничить потери.
+            # Исход: "E_close_42h_minus1pct" — закрытие с ограниченным убытком.
             if candles >= 2520:
-                # 42ч: если ROI от -10% до -15%
                 if -15 <= current_roi_now < -10:
-                    # закрыть в -1% от entry
                     if side == "BUY":
                         close_at = entry * 0.99
                     else:
@@ -586,7 +653,10 @@ def _sim_48h(df, side, entry, tp_prices, sl_orig, total_usdt):
                     close_price  = close_at
                     break
 
-    # Принудительное закрытие по 48ч лимиту
+    # ── Блок 7: Принудительное закрытие по истечении 48ч ──────────────────
+    # Если после выхода из цикла позиция всё ещё открыта (remaining_w > 0.001),
+    # значит ни один SL/TP/временное правило не сработал за 48 часов.
+    # Закрываем по последней доступной цене close. Исход: "E_timeout_48h".
     if remaining_w > 0.001:
         if not df.empty:
             last = float(df.iloc[min(candles - 1, len(df) - 1)]["close"])
@@ -596,21 +666,28 @@ def _sim_48h(df, side, entry, tp_prices, sl_orig, total_usdt):
         close_price = last
         outcome     = "E_timeout_48h"
 
-    # Если была ликвидация — PnL = -total_usdt
+    # ── Блок 8: Финальная проверка ликвидации ────────────────────────────
+    # Если в процессе симуляции цена доходила до порога ликвидации
+    # И исход — не полное закрытие по всем TP (TP1/TP2/TP3),
+    # то проверяем: если позиция закрылась по SL или уже помечена как ликвидация,
+    # перезаписываем PnL = −total_usdt (полная потеря маржи).
+    # Исход: "E_liquidation" — позиция была ликвидирована биржей.
+    # Почему не перезаписываем TP: если все TP сработали ДО ликвидации,
+    # позиция уже была закрыта с прибылью, ликвидация не произошла.
     if liquidation_at_candle is not None and outcome not in ("TP1", "TP2", "TP3"):
-        # Проверяем, не вышли ли мы по TP до ликвидации
         if outcome.startswith("E_SL") or outcome == "E_liquidation":
             realized = -total_usdt
             outcome  = "E_liquidation"
 
+    # ── Возвращаем результат симуляции ────────────────────────────────────
     return {
-        "outcome":               outcome,
-        "tps_hit":               tps_hit,
-        "pnl":                   round(realized, 4),
-        "roi":                   round(roi_pct(realized, total_usdt), 2),
-        "candles":               candles,
-        "close_price":           close_price,
-        "liquidation_at_candle": liquidation_at_candle,
+        "outcome":               outcome,           # строковый исход сценария
+        "tps_hit":               tps_hit,            # сколько TP сработало (0–n)
+        "pnl":                   round(realized, 4), # итоговый PnL в USDT
+        "roi":                   round(roi_pct(realized, total_usdt), 2),  # ROI в %
+        "candles":               candles,            # сколько свечей обработано
+        "close_price":           close_price,        # цена закрытия позиции
+        "liquidation_at_candle": liquidation_at_candle,  # свеча ликвидации (или None)
     }
 
 
