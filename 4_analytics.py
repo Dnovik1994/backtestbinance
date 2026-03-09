@@ -429,11 +429,11 @@ def _sim_trailing_custom(df, side, entry, tp_prices, sl_orig, sl_after_tp1, tota
 MAX_48H_CANDLES = 48 * 60  # 2880 минутных свечей = 48 часов
 
 
-def _sim_48h(df, side, entry, tp_prices, sl, total_usdt):
+def _sim_48h(df, side, entry, tp_prices, sl_orig, total_usdt):
     """
-    Сценарий E: 48-часовое управление.
-    Троллинг стопа (как сценарий B) + если через 48 часов сделка
-    не закрылась по TP3/SL — закрыть оставшуюся часть по текущей цене.
+    Сценарий E: 48-часовое управление с динамическим SL.
+    Троллинг стопа (как сценарий B) + динамический SL по глубине убытка +
+    временные правила (36ч/42ч/48ч) + отслеживание ликвидации.
     """
     n       = len(tp_prices)
     weights = _norm_weights(TP_WEIGHTS, n)
@@ -441,16 +441,32 @@ def _sim_48h(df, side, entry, tp_prices, sl, total_usdt):
     realized    = 0.0
     remaining_w = 1.0
     tps_hit     = 0
-    current_sl  = sl
-    outcome     = "TIMEOUT_48H"
+    outcome     = "E_timeout_48h"
     close_price = None
     candles     = 0
+    liquidation_at_candle = None
+    sl_locked   = False  # SL фиксируется после TP1 (троллинг)
+
+    # Порог ликвидации: цена, при которой убыток >= 100% от total_usdt
+    qty = (total_usdt * LEVERAGE) / entry
+    liq_dist = total_usdt / qty  # ценовое расстояние до ликвидации
+    if side == "BUY":
+        liq_price = entry - liq_dist
+    else:
+        liq_price = entry + liq_dist
 
     for _, row in df.iterrows():
         candles += 1
-        high, low = row["high"], row["low"]
+        if candles > MAX_48H_CANDLES:
+            break
+        high, low, close = row["high"], row["low"], float(row["close"])
 
-        # Проверяем TP
+        # --- Проверяем ликвидацию (фиксируем момент, но не останавливаем) ---
+        if liquidation_at_candle is None:
+            if (side == "BUY" and low <= liq_price) or (side == "SELL" and high >= liq_price):
+                liquidation_at_candle = candles
+
+        # --- Проверяем TP (троллинг как в сценарии B) ---
         while tps_hit < n:
             tp = tp_prices[tps_hit]
             if (side == "BUY" and high >= tp) or (side == "SELL" and low <= tp):
@@ -458,55 +474,123 @@ def _sim_48h(df, side, entry, tp_prices, sl, total_usdt):
                 realized    += pnl_usdt(entry, tp, side, total_usdt * w)
                 remaining_w -= w
                 tps_hit     += 1
+                sl_locked    = True
 
-                # Двигаем SL (как в сценарии B)
+                # Двигаем SL (троллинг)
                 if tps_hit == 1:
-                    current_sl = entry          # б/у
+                    current_sl_trailing = entry          # б/у
                 elif tps_hit == 2 and len(tp_prices) >= 1:
-                    current_sl = tp_prices[0]   # на TP1
+                    current_sl_trailing = tp_prices[0]   # на TP1
             else:
                 break
 
-        # Проверяем SL
-        if (side == "BUY" and low <= current_sl) or (side == "SELL" and high >= current_sl):
-            realized    += pnl_usdt(entry, current_sl, side, total_usdt * remaining_w)
-            remaining_w  = 0.0
-            outcome      = f"SL_after_TP{tps_hit}" if tps_hit > 0 else "SL"
-            close_price  = current_sl
-            break
-
+        # Все TP взяты
         if tps_hit == n and remaining_w <= 0.001:
             outcome     = f"TP{n}"
             close_price = tp_prices[-1]
             break
 
-        # 48-часовой лимит: закрываем по текущей цене
-        if candles >= MAX_48H_CANDLES and remaining_w > 0.001:
-            close_at     = float(row["close"])
-            realized    += pnl_usdt(entry, close_at, side, total_usdt * remaining_w)
-            remaining_w  = 0.0
-            close_price  = close_at
-            if tps_hit > 0:
-                outcome = f"TP{tps_hit}_TIMEOUT"
+        # --- Динамический SL (пока не зафиксирован троллингом) ---
+        if not sl_locked:
+            current_roi = roi_pct(pnl_usdt(entry, close, side, total_usdt), total_usdt)
+            if current_roi < -40:
+                # Не ставим SL, ждём 48ч
+                current_sl_dynamic = None
+            elif current_roi < -30:
+                # SL = entry ± 41%
+                if side == "BUY":
+                    current_sl_dynamic = entry * (1 - 0.41)
+                else:
+                    current_sl_dynamic = entry * (1 + 0.41)
+            elif current_roi < -20:
+                # SL = entry ± 31%
+                if side == "BUY":
+                    current_sl_dynamic = entry * (1 - 0.31)
+                else:
+                    current_sl_dynamic = entry * (1 + 0.31)
             else:
-                outcome = "TIMEOUT_48H"
-            break
+                # ROI от 0% до -20% → SL = entry ± 21%
+                if side == "BUY":
+                    current_sl_dynamic = entry * (1 - 0.21)
+                else:
+                    current_sl_dynamic = entry * (1 + 0.21)
 
-    # Если данные закончились раньше 48 часов и позиция ещё открыта
+            active_sl = current_sl_dynamic
+        else:
+            active_sl = current_sl_trailing
+
+        # --- Проверяем SL ---
+        if active_sl is not None:
+            if (side == "BUY" and low <= active_sl) or (side == "SELL" and high >= active_sl):
+                realized    += pnl_usdt(entry, active_sl, side, total_usdt * remaining_w)
+                remaining_w  = 0.0
+                if sl_locked:
+                    outcome = f"E_SL_after_TP{tps_hit}" if tps_hit > 0 else "E_SL"
+                else:
+                    outcome = "E_SL"
+                close_price  = active_sl
+                break
+
+        # --- Временные правила (свеча >= 2160 = 36ч) ---
+        if remaining_w > 0.001:
+            current_roi_now = roi_pct(pnl_usdt(entry, close, side, total_usdt), total_usdt)
+
+            if candles >= 2160:
+                # ROI от 1% до 1.5% → закрыть
+                if 1.0 <= current_roi_now <= 1.5:
+                    realized    += pnl_usdt(entry, close, side, total_usdt * remaining_w)
+                    remaining_w  = 0.0
+                    outcome      = "E_close_36_48h"
+                    close_price  = close
+                    break
+                # ROI отрицательный и <= -10% → закрыть немедленно
+                elif current_roi_now <= -10:
+                    realized    += pnl_usdt(entry, close, side, total_usdt * remaining_w)
+                    remaining_w  = 0.0
+                    outcome      = "E_close_minus10pct"
+                    close_price  = close
+                    break
+                # ROI > 1.7% → продолжать до 48ч (ничего не делаем)
+
+            if candles >= 2520:
+                # 42ч: если ROI от -10% до -15%
+                if -15 <= current_roi_now < -10:
+                    # закрыть в -1% от entry
+                    if side == "BUY":
+                        close_at = entry * 0.99
+                    else:
+                        close_at = entry * 1.01
+                    realized    += pnl_usdt(entry, close_at, side, total_usdt * remaining_w)
+                    remaining_w  = 0.0
+                    outcome      = "E_close_42h_minus1pct"
+                    close_price  = close_at
+                    break
+
+    # Принудительное закрытие по 48ч лимиту
     if remaining_w > 0.001:
-        last = float(df.iloc[-1]["close"])
+        if not df.empty:
+            last = float(df.iloc[min(candles - 1, len(df) - 1)]["close"])
+        else:
+            last = entry
         realized   += pnl_usdt(entry, last, side, total_usdt * remaining_w)
         close_price = last
-        if tps_hit > 0:
-            outcome = f"TP{tps_hit}_TIMEOUT"
+        outcome     = "E_timeout_48h"
+
+    # Если была ликвидация — PnL = -total_usdt
+    if liquidation_at_candle is not None and outcome not in ("TP1", "TP2", "TP3"):
+        # Проверяем, не вышли ли мы по TP до ликвидации
+        if outcome.startswith("E_SL") or outcome == "E_liquidation":
+            realized = -total_usdt
+            outcome  = "E_liquidation"
 
     return {
-        "outcome":    outcome,
-        "tps_hit":    tps_hit,
-        "pnl":        round(realized, 4),
-        "roi":        round(roi_pct(realized, total_usdt), 2),
-        "candles":    candles,
-        "close_price": close_price,
+        "outcome":               outcome,
+        "tps_hit":               tps_hit,
+        "pnl":                   round(realized, 4),
+        "roi":                   round(roi_pct(realized, total_usdt), 2),
+        "candles":               candles,
+        "close_price":           close_price,
+        "liquidation_at_candle": liquidation_at_candle,
     }
 
 
@@ -545,12 +629,13 @@ def _norm_weights(weights, k):
 def _empty_result(reason: str = "NO_DATA"):
     base = {"outcome": reason, "tps_hit": 0, "pnl": 0.0, "roi": 0.0,
             "candles": None, "close_price": None}
+    base_48h = {**base, "liquidation_at_candle": None}
     result = {
         "total_usdt": POSITION_USDT, "has_dca": False,
         "tp_prices": [], "sl": None,
         "base": base, "trail": base,
         "wide_sl": base,
-        "48h": base,
+        "48h": base_48h,
         "direction": {f"dir_{h}m": None for h in DIRECTION_HORIZONS},
     }
     for pct in SL_AFTER_TP1_VARIANTS:
@@ -669,6 +754,7 @@ def main():
             "E_outcome":    sim["48h"]["outcome"],
             "E_pnl":        sim["48h"]["pnl"],
             "E_roi":        sim["48h"]["roi"],
+            "E_liquidation_at_candle": sim["48h"].get("liquidation_at_candle"),
 
             # Вероятность направления
             "dir_5m":       sim["direction"].get("dir_5m"),
@@ -733,13 +819,22 @@ def main():
     report.append(f"Плечо: x{LEVERAGE}")
     report.append("")
 
-    def scenario_stats(col_prefix, label):
-        sub = df_clean[df_clean[f"{col_prefix}_outcome"] != "NO_DATA"]
+    def scenario_stats(col_prefix, label, data=None):
+        src = data if data is not None else df_clean
+        sub = src[src[f"{col_prefix}_outcome"] != "NO_DATA"]
         if sub.empty:
             return
         total   = len(sub)
-        wins    = sub[~sub[f"{col_prefix}_outcome"].str.startswith("SL")]
-        losses  = sub[sub[f"{col_prefix}_outcome"].str.startswith("SL")]
+        outcome_col = sub[f"{col_prefix}_outcome"]
+
+        # Winrate: для E — победа = НЕ E_SL* и НЕ E_liquidation
+        if col_prefix == "E":
+            wins   = sub[~outcome_col.str.startswith("E_SL") & (outcome_col != "E_liquidation")]
+            losses = sub[outcome_col.str.startswith("E_SL") | (outcome_col == "E_liquidation")]
+        else:
+            wins   = sub[~outcome_col.str.startswith("SL")]
+            losses = sub[outcome_col.str.startswith("SL")]
+
         winrate = len(wins) / total * 100 if total else 0
         total_pnl = sub[f"{col_prefix}_pnl"].sum()
         avg_pnl   = sub[f"{col_prefix}_pnl"].mean()
@@ -751,7 +846,8 @@ def main():
         stats = [
             ["Winrate",              f"{winrate:.1f}%"],
             ["Победных сделок",      f"{len(wins)} / {total}"],
-            ["Убыточных (SL)",       f"{len(losses)} / {total}"],
+            ["Убыточных (SL/ликв.)" if col_prefix == "E" else "Убыточных (SL)",
+                                     f"{len(losses)} / {total}"],
             ["Суммарный PnL",        f"{total_pnl:+.2f} USDT"],
             ["Средний PnL",          f"{avg_pnl:+.2f} USDT"],
             ["Средний ROI",          f"{avg_roi:+.2f}%"],
@@ -771,7 +867,23 @@ def main():
     scenario_stats("C10", "C) SL после TP1: -10% от входа")
     scenario_stats("C15", "C) SL после TP1: -15% от входа")
     scenario_stats("D",  "D) Широкий стоп 50% от объёма позиции")
-    scenario_stats("E",  "E) 48-часовое управление (троллинг + закрытие через 48ч)")
+    scenario_stats("E",  "E) 48ч управление (троллинг + динамический SL)")
+
+    # ── Статистика без DCA ────────────────────────────────────
+    report.append("═" * 60)
+    report.append("     СТАТИСТИКА БЕЗ УЧЁТА УСРЕДНЕНИЙ")
+    report.append("═" * 60)
+    df_no_dca = df_clean[df_clean["has_dca"] == False]
+    report.append(f"Сделок без DCA: {len(df_no_dca)}")
+    report.append("")
+
+    scenario_stats("A",   "A) Базовый (без троллинга стопа)", data=df_no_dca)
+    scenario_stats("B",   "B) Троллинг стопа (б/у после TP1, TP1 после TP2)", data=df_no_dca)
+    scenario_stats("C5",  "C) SL после TP1: -5% от входа", data=df_no_dca)
+    scenario_stats("C10", "C) SL после TP1: -10% от входа", data=df_no_dca)
+    scenario_stats("C15", "C) SL после TP1: -15% от входа", data=df_no_dca)
+    scenario_stats("D",   "D) Широкий стоп 50% от объёма позиции", data=df_no_dca)
+    scenario_stats("E",   "E) 48ч управление (троллинг + динамический SL)", data=df_no_dca)
 
     # Зависимости
     report.append("── Зависимость: размер стопа vs результат ─────────────")
