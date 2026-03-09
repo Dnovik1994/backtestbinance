@@ -245,6 +245,36 @@ def simulate(row: Dict, df: pd.DataFrame, force_no_dca: bool = False) -> Dict[st
     # ── Сценарий F1: F + фильтр SL>5% ────────────────────────
     skip_result_f1 = {"outcome": "F1_skip", "tps_hit": 0, "pnl": 0.0, "roi": 0.0, "candles": 0, "close_price": None}
     result_f1 = _sim_f(df, side, entry, tp_prices, sl_wide, total_usdt) if sl_dist >= 0.05 else skip_result_f1
+    # ── Сценарий H: DCA только если цена ушла против >2% ────
+    # Определяем цену усреднения из dca_price или dca_updates_detail
+    dca_entry = None
+    if not force_no_dca and has_dca:
+        if row.get("dca_price") and str(row["dca_price"]).strip():
+            try:
+                dca_entry = float(row["dca_price"])
+            except (ValueError, TypeError):
+                pass
+        if dca_entry is None and row.get("dca_updates_detail"):
+            try:
+                details = json.loads(row["dca_updates_detail"]) if isinstance(row["dca_updates_detail"], str) else row["dca_updates_detail"]
+                if details and isinstance(details, list):
+                    for d in details:
+                        ne = d.get("new_entry")
+                        if ne is not None:
+                            dca_entry = float(ne)
+                            break
+            except (json.JSONDecodeError, ValueError, TypeError):
+                pass
+
+    # DCA применяется только если цена усреднения отклонилась >2% против позиции
+    h_use_dca = False
+    if dca_entry is not None and has_dca and not force_no_dca:
+        if side == "BUY" and dca_entry < entry * 0.98:
+            h_use_dca = True
+        elif side == "SELL" and dca_entry > entry * 1.02:
+            h_use_dca = True
+    h_usdt = total_usdt if h_use_dca else POSITION_USDT
+    result_h = _sim_base(df, side, entry, tp_prices, sl, h_usdt)
 
     # ── Блок вероятности направления ─────────────────────────
     direction_prob = _calc_direction_prob(df, side, DIRECTION_HORIZONS)
@@ -281,6 +311,8 @@ def simulate(row: Dict, df: pd.DataFrame, force_no_dca: bool = False) -> Dict[st
 
         # Сценарий F1
         "f1":             result_f1,
+        # Сценарий H
+        "h":              result_h,
 
         # Вероятность направления
         "direction":      direction_prob,
@@ -895,6 +927,7 @@ def _empty_result(reason: str = "NO_DATA"):
         "f": base,
         "g": base,
         "f1": base,
+        "h": base,
         "direction": {f"dir_{h}m": None for h in DIRECTION_HORIZONS},
     }
     for pct in SL_AFTER_TP1_VARIANTS:
@@ -1033,6 +1066,11 @@ def main():
             "F1_tps_hit":   sim["f1"]["tps_hit"],
             "F1_pnl":       sim["f1"]["pnl"],
             "F1_roi":       sim["f1"]["roi"],
+            # Сценарий H: DCA только если цена ушла >2%
+            "H_outcome":    sim["h"]["outcome"],
+            "H_tps_hit":    sim["h"]["tps_hit"],
+            "H_pnl":        sim["h"]["pnl"],
+            "H_roi":        sim["h"]["roi"],
 
             # Вероятность направления
             "dir_5m":       sim["direction"].get("dir_5m"),
@@ -1098,6 +1136,10 @@ def main():
             "ND_F1_tps_hit":   sim_nd["f1"]["tps_hit"],
             "ND_F1_pnl":       sim_nd["f1"]["pnl"],
             "ND_F1_roi":       sim_nd["f1"]["roi"],
+            "ND_H_outcome":    sim_nd["h"]["outcome"],
+            "ND_H_tps_hit":    sim_nd["h"]["tps_hit"],
+            "ND_H_pnl":        sim_nd["h"]["pnl"],
+            "ND_H_roi":        sim_nd["h"]["roi"],
         }
         results.append(row)
         time.sleep(0.25)
@@ -1240,6 +1282,7 @@ def main():
     scenario_stats("F",  "F) D+C15 (широкий стоп, 70/20/10, троллинг -15% ROI)")
     scenario_stats("G",  "G) Фильтр SL>5% (базовый)")
     scenario_stats("F1", "F1) F + фильтр SL>5%")
+    scenario_stats("H",  "H) DCA только если цена ушла >2% против позиции")
 
     # ── Статистика без усреднения (ND_* колонки) ──────────────
     report.append("═" * 60)
@@ -1258,6 +1301,7 @@ def main():
     scenario_stats("ND_F",   "F) D+C15 (широкий стоп, 70/20/10, троллинг -15% ROI)")
     scenario_stats("ND_G",   "G) Фильтр SL>5% (базовый)")
     scenario_stats("ND_F1",  "F1) F + фильтр SL>5%")
+    scenario_stats("ND_H",   "H) DCA только если цена ушла >2% против позиции")
 
     # Зависимости
     report.append("── Зависимость: размер стопа vs результат ─────────────")
@@ -1357,6 +1401,7 @@ SCENARIOS = {
     "F":   {"label": "F · D+C15",     "color": "#f97316", "width": 2.0},
     "G":   {"label": "G · фильтр SL>5%", "color": "#eab308", "width": 2.0},
     "F1":  {"label": "F1 · F+фильтр",   "color": "#f43f5e", "width": 2.0},
+    "H":   {"label": "H · DCA>2%",    "color": "#84cc16", "width": 2.0},
 }
 
 ND_SCENARIOS = {
@@ -1371,6 +1416,7 @@ ND_SCENARIOS = {
     "ND_F":   {"label": "F · D+C15",     "color": "#f97316", "width": 2.0},
     "ND_G":   {"label": "G · фильтр SL>5%", "color": "#eab308", "width": 2.0},
     "ND_F1":  {"label": "F1 · F+фильтр",   "color": "#f43f5e", "width": 2.0},
+    "ND_H":   {"label": "H · DCA>2%",    "color": "#84cc16", "width": 2.0},
 }
 
 def _pnl_col(scen):
