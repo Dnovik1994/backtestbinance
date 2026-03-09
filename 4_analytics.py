@@ -237,6 +237,15 @@ def simulate(row: Dict, df: pd.DataFrame, force_no_dca: bool = False) -> Dict[st
     # ── Сценарий F: Широкий стоп + веса 70/20/10 + троллинг -15% ROI ──
     result_f = _sim_f(df, side, entry, tp_prices, sl_wide, total_usdt)
 
+    # ── Сценарий G: Фильтр по размеру SL (>5% от entry) ──────
+    sl_dist = abs(sl - entry) / entry
+    skip_result = {"outcome": "G_skip", "tps_hit": 0, "pnl": 0.0, "roi": 0.0, "candles": 0, "close_price": None}
+    result_g = _sim_base(df, side, entry, tp_prices, sl, total_usdt) if sl_dist >= 0.05 else skip_result
+
+    # ── Сценарий F1: F + фильтр SL>5% ────────────────────────
+    skip_result_f1 = {"outcome": "F1_skip", "tps_hit": 0, "pnl": 0.0, "roi": 0.0, "candles": 0, "close_price": None}
+    result_f1 = _sim_f(df, side, entry, tp_prices, sl_wide, total_usdt) if sl_dist >= 0.05 else skip_result_f1
+
     # ── Блок вероятности направления ─────────────────────────
     direction_prob = _calc_direction_prob(df, side, DIRECTION_HORIZONS)
 
@@ -266,6 +275,12 @@ def simulate(row: Dict, df: pd.DataFrame, force_no_dca: bool = False) -> Dict[st
 
         # Сценарий F
         "f":              result_f,
+
+        # Сценарий G
+        "g":              result_g,
+
+        # Сценарий F1
+        "f1":             result_f1,
 
         # Вероятность направления
         "direction":      direction_prob,
@@ -878,6 +893,8 @@ def _empty_result(reason: str = "NO_DATA"):
         "48h": base,
         "24h": base,
         "f": base,
+        "g": base,
+        "f1": base,
         "direction": {f"dir_{h}m": None for h in DIRECTION_HORIZONS},
     }
     for pct in SL_AFTER_TP1_VARIANTS:
@@ -1005,6 +1022,18 @@ def main():
             "F_pnl":        sim["f"]["pnl"],
             "F_roi":        sim["f"]["roi"],
 
+            # Сценарий G: Фильтр SL>5%
+            "G_outcome":    sim["g"]["outcome"],
+            "G_tps_hit":    sim["g"]["tps_hit"],
+            "G_pnl":        sim["g"]["pnl"],
+            "G_roi":        sim["g"]["roi"],
+
+            # Сценарий F1: F + фильтр SL>5%
+            "F1_outcome":   sim["f1"]["outcome"],
+            "F1_tps_hit":   sim["f1"]["tps_hit"],
+            "F1_pnl":       sim["f1"]["pnl"],
+            "F1_roi":       sim["f1"]["roi"],
+
             # Вероятность направления
             "dir_5m":       sim["direction"].get("dir_5m"),
             "dir_15m":      sim["direction"].get("dir_15m"),
@@ -1059,6 +1088,16 @@ def main():
             "ND_F_tps_hit":    sim_nd["f"]["tps_hit"],
             "ND_F_pnl":        sim_nd["f"]["pnl"],
             "ND_F_roi":        sim_nd["f"]["roi"],
+
+            "ND_G_outcome":    sim_nd["g"]["outcome"],
+            "ND_G_tps_hit":    sim_nd["g"]["tps_hit"],
+            "ND_G_pnl":        sim_nd["g"]["pnl"],
+            "ND_G_roi":        sim_nd["g"]["roi"],
+
+            "ND_F1_outcome":   sim_nd["f1"]["outcome"],
+            "ND_F1_tps_hit":   sim_nd["f1"]["tps_hit"],
+            "ND_F1_pnl":       sim_nd["f1"]["pnl"],
+            "ND_F1_roi":       sim_nd["f1"]["roi"],
         }
         results.append(row)
         time.sleep(0.25)
@@ -1133,6 +1172,24 @@ def main():
             loss_mask = outcome_col.isin(["E1_SL", "E1_SL_dynamic"])
             losses = sub[loss_mask]
             wins   = sub[~loss_mask]
+        elif col_prefix in ("G", "ND_G"):
+            # Исключаем пропущенные (G_skip) из подсчёта
+            sub = sub[outcome_col != "G_skip"]
+            if sub.empty:
+                return
+            total = len(sub)
+            outcome_col = sub[f"{col_prefix}_outcome"]
+            losses = sub[outcome_col == "SL"]
+            wins   = sub[outcome_col != "SL"]
+        elif col_prefix in ("F1", "ND_F1"):
+            # Исключаем пропущенные (F1_skip) из подсчёта
+            sub = sub[outcome_col != "F1_skip"]
+            if sub.empty:
+                return
+            total = len(sub)
+            outcome_col = sub[f"{col_prefix}_outcome"]
+            losses = sub[outcome_col == "SL"]
+            wins   = sub[outcome_col != "SL"]
         else:
             losses = sub[outcome_col == "SL"]
             wins   = sub[outcome_col != "SL"]
@@ -1181,6 +1238,8 @@ def main():
     scenario_stats("E",  "E) 48ч управление (троллинг + динамический SL)")
     scenario_stats("E1", "E1) 24ч управление (как E, фаза 2 с 24ч)")
     scenario_stats("F",  "F) D+C15 (широкий стоп, 70/20/10, троллинг -15% ROI)")
+    scenario_stats("G",  "G) Фильтр SL>5% (базовый)")
+    scenario_stats("F1", "F1) F + фильтр SL>5%")
 
     # ── Статистика без усреднения (ND_* колонки) ──────────────
     report.append("═" * 60)
@@ -1197,6 +1256,8 @@ def main():
     scenario_stats("ND_E",   "E) 48ч управление (троллинг + динамический SL)")
     scenario_stats("ND_E1",  "E1) 24ч управление (как E, фаза 2 с 24ч)")
     scenario_stats("ND_F",   "F) D+C15 (широкий стоп, 70/20/10, троллинг -15% ROI)")
+    scenario_stats("ND_G",   "G) Фильтр SL>5% (базовый)")
+    scenario_stats("ND_F1",  "F1) F + фильтр SL>5%")
 
     # Зависимости
     report.append("── Зависимость: размер стопа vs результат ─────────────")
@@ -1294,6 +1355,8 @@ SCENARIOS = {
     "E":   {"label": "E · 48ч",        "color": "#a855f7", "width": 2.0},
     "E1":  {"label": "E1 · 24ч",      "color": "#06b6d4", "width": 2.0},
     "F":   {"label": "F · D+C15",     "color": "#f97316", "width": 2.0},
+    "G":   {"label": "G · фильтр SL>5%", "color": "#eab308", "width": 2.0},
+    "F1":  {"label": "F1 · F+фильтр",   "color": "#f43f5e", "width": 2.0},
 }
 
 ND_SCENARIOS = {
@@ -1306,6 +1369,8 @@ ND_SCENARIOS = {
     "ND_E":   {"label": "E · 48ч",        "color": "#a855f7", "width": 2.0},
     "ND_E1":  {"label": "E1 · 24ч",      "color": "#06b6d4", "width": 2.0},
     "ND_F":   {"label": "F · D+C15",     "color": "#f97316", "width": 2.0},
+    "ND_G":   {"label": "G · фильтр SL>5%", "color": "#eab308", "width": 2.0},
+    "ND_F1":  {"label": "F1 · F+фильтр",   "color": "#f43f5e", "width": 2.0},
 }
 
 def _pnl_col(scen):
