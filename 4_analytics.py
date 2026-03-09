@@ -208,6 +208,9 @@ def simulate(row: Dict, df: pd.DataFrame) -> Dict[str, Any]:
     sl_wide = (entry - sl_wide_dist) if side == "BUY" else (entry + sl_wide_dist)
     result_wide_sl = _sim_base(df, side, entry, tp_prices, sl_wide, total_usdt)
 
+    # ── Сценарий E: 48-часовое управление ─────────────────────
+    result_48h = _sim_48h(df, side, entry, tp_prices, sl, total_usdt)
+
     # ── Блок вероятности направления ─────────────────────────
     direction_prob = _calc_direction_prob(df, side, DIRECTION_HORIZONS)
 
@@ -228,6 +231,9 @@ def simulate(row: Dict, df: pd.DataFrame) -> Dict[str, Any]:
 
         # Сценарий D
         "wide_sl":        result_wide_sl,
+
+        # Сценарий E
+        "48h":            result_48h,
 
         # Вероятность направления
         "direction":      direction_prob,
@@ -420,6 +426,90 @@ def _sim_trailing_custom(df, side, entry, tp_prices, sl_orig, sl_after_tp1, tota
     }
 
 
+MAX_48H_CANDLES = 48 * 60  # 2880 минутных свечей = 48 часов
+
+
+def _sim_48h(df, side, entry, tp_prices, sl, total_usdt):
+    """
+    Сценарий E: 48-часовое управление.
+    Троллинг стопа (как сценарий B) + если через 48 часов сделка
+    не закрылась по TP3/SL — закрыть оставшуюся часть по текущей цене.
+    """
+    n       = len(tp_prices)
+    weights = _norm_weights(TP_WEIGHTS, n)
+
+    realized    = 0.0
+    remaining_w = 1.0
+    tps_hit     = 0
+    current_sl  = sl
+    outcome     = "TIMEOUT_48H"
+    close_price = None
+    candles     = 0
+
+    for _, row in df.iterrows():
+        candles += 1
+        high, low = row["high"], row["low"]
+
+        # Проверяем TP
+        while tps_hit < n:
+            tp = tp_prices[tps_hit]
+            if (side == "BUY" and high >= tp) or (side == "SELL" and low <= tp):
+                w = weights[tps_hit]
+                realized    += pnl_usdt(entry, tp, side, total_usdt * w)
+                remaining_w -= w
+                tps_hit     += 1
+
+                # Двигаем SL (как в сценарии B)
+                if tps_hit == 1:
+                    current_sl = entry          # б/у
+                elif tps_hit == 2 and len(tp_prices) >= 1:
+                    current_sl = tp_prices[0]   # на TP1
+            else:
+                break
+
+        # Проверяем SL
+        if (side == "BUY" and low <= current_sl) or (side == "SELL" and high >= current_sl):
+            realized    += pnl_usdt(entry, current_sl, side, total_usdt * remaining_w)
+            remaining_w  = 0.0
+            outcome      = f"SL_after_TP{tps_hit}" if tps_hit > 0 else "SL"
+            close_price  = current_sl
+            break
+
+        if tps_hit == n and remaining_w <= 0.001:
+            outcome     = f"TP{n}"
+            close_price = tp_prices[-1]
+            break
+
+        # 48-часовой лимит: закрываем по текущей цене
+        if candles >= MAX_48H_CANDLES and remaining_w > 0.001:
+            close_at     = float(row["close"])
+            realized    += pnl_usdt(entry, close_at, side, total_usdt * remaining_w)
+            remaining_w  = 0.0
+            close_price  = close_at
+            if tps_hit > 0:
+                outcome = f"TP{tps_hit}_TIMEOUT"
+            else:
+                outcome = "TIMEOUT_48H"
+            break
+
+    # Если данные закончились раньше 48 часов и позиция ещё открыта
+    if remaining_w > 0.001:
+        last = float(df.iloc[-1]["close"])
+        realized   += pnl_usdt(entry, last, side, total_usdt * remaining_w)
+        close_price = last
+        if tps_hit > 0:
+            outcome = f"TP{tps_hit}_TIMEOUT"
+
+    return {
+        "outcome":    outcome,
+        "tps_hit":    tps_hit,
+        "pnl":        round(realized, 4),
+        "roi":        round(roi_pct(realized, total_usdt), 2),
+        "candles":    candles,
+        "close_price": close_price,
+    }
+
+
 def _calc_direction_prob(df: pd.DataFrame, side: str, horizons: List[int]) -> Dict[str, float]:
     """
     Для каждого горизонта считает % свечей где цена пошла в нужную сторону.
@@ -460,6 +550,7 @@ def _empty_result(reason: str = "NO_DATA"):
         "tp_prices": [], "sl": None,
         "base": base, "trail": base,
         "wide_sl": base,
+        "48h": base,
         "direction": {f"dir_{h}m": None for h in DIRECTION_HORIZONS},
     }
     for pct in SL_AFTER_TP1_VARIANTS:
@@ -574,6 +665,11 @@ def main():
             "D_pnl":        sim["wide_sl"]["pnl"],
             "D_roi":        sim["wide_sl"]["roi"],
 
+            # Сценарий E: 48-часовое управление
+            "E_outcome":    sim["48h"]["outcome"],
+            "E_pnl":        sim["48h"]["pnl"],
+            "E_roi":        sim["48h"]["roi"],
+
             # Вероятность направления
             "dir_5m":       sim["direction"].get("dir_5m"),
             "dir_15m":      sim["direction"].get("dir_15m"),
@@ -675,10 +771,11 @@ def main():
     scenario_stats("C10", "C) SL после TP1: -10% от входа")
     scenario_stats("C15", "C) SL после TP1: -15% от входа")
     scenario_stats("D",  "D) Широкий стоп 50% от объёма позиции")
+    scenario_stats("E",  "E) 48-часовое управление (троллинг + закрытие через 48ч)")
 
     # Зависимости
     report.append("── Зависимость: размер стопа vs результат ─────────────")
-    df_clean["sl_dist_pct"] = df_res.apply(lambda r: abs(
+    df_clean["sl_dist_pct"] = df_clean.apply(lambda r: abs(
         (float(r["sl"]) - float(r["entry"])) / float(r["entry"]) * 100
     ) if r["sl"] and r["entry"] else None, axis=1)
 
@@ -695,10 +792,10 @@ def main():
 
     # Зависимость: дистанция до TP1 vs вероятность достижения
     report.append("── Зависимость: дистанция до TP1 vs вероятность достижения ──")
-    df_clean["tp1_dist_pct"] = df_res.apply(lambda r: abs(
+    df_clean["tp1_dist_pct"] = df_clean.apply(lambda r: abs(
         (float(r["tp1"]) - float(r["entry"])) / float(r["entry"]) * 100
     ) if r["tp1"] and r["entry"] else None, axis=1)
-    df_clean["tp1_hit"] = df_res["A_tps_hit"] >= 1
+    df_clean["tp1_hit"] = df_clean["A_tps_hit"] >= 1
 
     tp_bins   = [0, 0.5, 1.0, 1.5, 2.0, 3.0, 100]
     tp_labels = ["<0.5%", "0.5-1%", "1-1.5%", "1.5-2%", "2-3%", ">3%"]
@@ -768,12 +865,13 @@ SCENARIOS = {
     "C10": {"label": "C10 · SL-10%",   "color": "#f97316", "width": 1.5},
     "C15": {"label": "C15 · SL-15%",   "color": "#ef4444", "width": 1.5},
     "D":   {"label": "D · фикс.стоп",  "color": "#10b981", "width": 2.5},
+    "E":   {"label": "E · 48ч",        "color": "#a855f7", "width": 2.0},
 }
 
-def _pnl_col(df, scen):
+def _pnl_col(scen):
     return f"{scen}_pnl"
 
-def _out_col(df, scen):
+def _out_col(scen):
     return f"{scen}_outcome"
 
 
@@ -797,7 +895,7 @@ def generate_equity_chart(df: "pd.DataFrame") -> None:
 
     for _, row in df.iterrows():
         for s in SCENARIOS:
-            col = _pnl_col(df, s)
+            col = _pnl_col(s)
             bal = eq[s][-1] + (row[col] if col in df.columns else 0)
             eq[s].append(bal)
             if bal > peak[s]:
@@ -826,7 +924,7 @@ def generate_equity_chart(df: "pd.DataFrame") -> None:
     months = sorted(df["_month"].unique())
     monthly = {}
     for s in SCENARIOS:
-        col = _pnl_col(df, s)
+        col = _pnl_col(s)
         if col in df.columns:
             monthly[s] = df.groupby("_month")[col].sum().reindex(months, fill_value=0)
 
