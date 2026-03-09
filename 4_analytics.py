@@ -44,8 +44,8 @@ TP_WEIGHTS      = [0.5, 0.3, 0.2]   # доля позиции на TP1/TP2/TP3
 # Горизонты для анализа вероятности направления (в минутах)
 DIRECTION_HORIZONS = [5, 15, 30, 60]
 
-# Варианты стопа после TP1 (% от точки входа)
-SL_AFTER_TP1_VARIANTS = [-0.05, -0.10, -0.15]  # -5%, -10%, -15%
+# Варианты стопа после TP1 (порог ROI позиции)
+SL_AFTER_TP1_VARIANTS = [-0.05, -0.10, -0.15]  # ROI -5%, -10%, -15%
 
 # Максимальный размер стопа от entry (защита от опечаток)
 MAX_SL_DIST_PCT = 0.20   # 20%
@@ -215,10 +215,10 @@ def simulate(row: Dict, df: pd.DataFrame, force_no_dca: bool = False) -> Dict[st
     # ── Сценарий B: Троллинг стопа (после TP1 → в б/у, после TP2 → TP1) ──
     result_trail = _sim_trailing(df, side, entry, tp_prices, sl, total_usdt)
 
-    # ── Сценарий C: Варианты стопа после TP1 (-5/-10/-15%) ───
+    # ── Сценарий C: Варианты стопа после TP1 (ROI -5/-10/-15%) ───
     variants_c = {}
     for pct in SL_AFTER_TP1_VARIANTS:
-        sl_new = entry * (1 + pct) if side == "BUY" else entry * (1 - pct)
+        sl_new = entry * (1 - pct / LEVERAGE) if side == "BUY" else entry * (1 + pct / LEVERAGE)
         variants_c[f"sl_after_tp1_{int(abs(pct)*100)}pct"] = _sim_trailing_custom(
             df, side, entry, tp_prices, sl, sl_new, total_usdt
         )
@@ -983,9 +983,9 @@ def main():
 
     scenario_stats("A", "A) Базовый (без троллинга стопа)")
     scenario_stats("B", "B) Троллинг стопа (б/у после TP1, TP1 после TP2)")
-    scenario_stats("C5",  "C) SL после TP1: -5% от входа")
-    scenario_stats("C10", "C) SL после TP1: -10% от входа")
-    scenario_stats("C15", "C) SL после TP1: -15% от входа")
+    scenario_stats("C5",  "C) SL после TP1: ROI -5%")
+    scenario_stats("C10", "C) SL после TP1: ROI -10%")
+    scenario_stats("C15", "C) SL после TP1: ROI -15%")
     scenario_stats("D",  "D) Широкий стоп 50% от объёма позиции")
     scenario_stats("E",  "E) 48ч управление (троллинг + динамический SL)")
 
@@ -997,9 +997,9 @@ def main():
 
     scenario_stats("ND_A",   "A) Базовый (без троллинга стопа)")
     scenario_stats("ND_B",   "B) Троллинг стопа (б/у после TP1, TP1 после TP2)")
-    scenario_stats("ND_C5",  "C) SL после TP1: -5% от входа")
-    scenario_stats("ND_C10", "C) SL после TP1: -10% от входа")
-    scenario_stats("ND_C15", "C) SL после TP1: -15% от входа")
+    scenario_stats("ND_C5",  "C) SL после TP1: ROI -5%")
+    scenario_stats("ND_C10", "C) SL после TP1: ROI -10%")
+    scenario_stats("ND_C15", "C) SL после TP1: ROI -15%")
     scenario_stats("ND_D",   "D) Широкий стоп 50% от объёма позиции")
     scenario_stats("ND_E",   "E) 48ч управление (троллинг + динамический SL)")
 
