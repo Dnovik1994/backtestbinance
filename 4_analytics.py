@@ -194,10 +194,11 @@ def roi_pct(pnl: float, usdt_invested: float) -> float:
 # ===========================
 # Симуляция одной сделки
 # ===========================
-def simulate(row: Dict, df: pd.DataFrame) -> Dict[str, Any]:
+def simulate(row: Dict, df: pd.DataFrame, force_no_dca: bool = False) -> Dict[str, Any]:
     """
     Симулирует сделку по минутным свечам.
     Возвращает подробный результат по всем сценариям.
+    force_no_dca=True — всегда использует POSITION_USDT (без усреднения).
     """
     side        = row["side"]
     entry       = float(row["entry_price"])
@@ -211,7 +212,10 @@ def simulate(row: Dict, df: pd.DataFrame) -> Dict[str, Any]:
     n_tp        = len(tp_prices)
 
     # Объём с учётом усреднения
-    total_usdt  = POSITION_USDT + (DCA_USDT if has_dca else 0)
+    if force_no_dca:
+        total_usdt = POSITION_USDT
+    else:
+        total_usdt  = POSITION_USDT + (DCA_USDT if has_dca else 0)
 
     if df.empty or not tp_prices or sl is None:
         return _empty_result()
@@ -719,6 +723,7 @@ def main():
         else:
             df = get_klines_batch(sym, ts_ms)
         sim = simulate(trade, df)
+        sim_nd = simulate(trade, df, force_no_dca=True)
 
         # Если сделка невалидная (опечатка) — пишем в отдельный файл
         if sim["base"]["outcome"] == "INVALID_SL":
@@ -794,6 +799,39 @@ def main():
             "dir_15m":      sim["direction"].get("dir_15m"),
             "dir_30m":      sim["direction"].get("dir_30m"),
             "dir_60m":      sim["direction"].get("dir_60m"),
+
+            # ND (No DCA) — пересчёт всех сценариев с позицией = POSITION_USDT
+            "ND_A_outcome":    sim_nd["base"]["outcome"],
+            "ND_A_tps_hit":    sim_nd["base"]["tps_hit"],
+            "ND_A_pnl":        sim_nd["base"]["pnl"],
+            "ND_A_roi":        sim_nd["base"]["roi"],
+            "ND_A_candles":    sim_nd["base"]["candles"],
+
+            "ND_B_outcome":    sim_nd["trail"]["outcome"],
+            "ND_B_tps_hit":    sim_nd["trail"]["tps_hit"],
+            "ND_B_pnl":        sim_nd["trail"]["pnl"],
+            "ND_B_roi":        sim_nd["trail"]["roi"],
+
+            "ND_C5_outcome":   sim_nd["sl_after_tp1_5pct"]["outcome"],
+            "ND_C5_pnl":       sim_nd["sl_after_tp1_5pct"]["pnl"],
+            "ND_C5_roi":       sim_nd["sl_after_tp1_5pct"]["roi"],
+
+            "ND_C10_outcome":  sim_nd["sl_after_tp1_10pct"]["outcome"],
+            "ND_C10_pnl":      sim_nd["sl_after_tp1_10pct"]["pnl"],
+            "ND_C10_roi":      sim_nd["sl_after_tp1_10pct"]["roi"],
+
+            "ND_C15_outcome":  sim_nd["sl_after_tp1_15pct"]["outcome"],
+            "ND_C15_pnl":      sim_nd["sl_after_tp1_15pct"]["pnl"],
+            "ND_C15_roi":      sim_nd["sl_after_tp1_15pct"]["roi"],
+
+            "ND_D_outcome":    sim_nd["wide_sl"]["outcome"],
+            "ND_D_pnl":        sim_nd["wide_sl"]["pnl"],
+            "ND_D_roi":        sim_nd["wide_sl"]["roi"],
+
+            "ND_E_outcome":    sim_nd["48h"]["outcome"],
+            "ND_E_pnl":        sim_nd["48h"]["pnl"],
+            "ND_E_roi":        sim_nd["48h"]["roi"],
+            "ND_E_liquidation_at_candle": sim_nd["48h"].get("liquidation_at_candle"),
         }
         results.append(row)
         time.sleep(0.25)
@@ -860,8 +898,8 @@ def main():
         total   = len(sub)
         outcome_col = sub[f"{col_prefix}_outcome"]
 
-        # Winrate: для E — победа = НЕ E_SL* и НЕ E_liquidation
-        if col_prefix == "E":
+        # Winrate: для E/ND_E — победа = НЕ E_SL* и НЕ E_liquidation
+        if col_prefix in ("E", "ND_E"):
             wins   = sub[~outcome_col.str.startswith("E_SL") & (outcome_col != "E_liquidation")]
             losses = sub[outcome_col.str.startswith("E_SL") | (outcome_col == "E_liquidation")]
         else:
@@ -879,7 +917,7 @@ def main():
         stats = [
             ["Winrate",              f"{winrate:.1f}%"],
             ["Победных сделок",      f"{len(wins)} / {total}"],
-            ["Убыточных (SL/ликв.)" if col_prefix == "E" else "Убыточных (SL)",
+            ["Убыточных (SL/ликв.)" if col_prefix in ("E", "ND_E") else "Убыточных (SL)",
                                      f"{len(losses)} / {total}"],
             ["Суммарный PnL",        f"{total_pnl:+.2f} USDT"],
             ["Средний PnL",          f"{avg_pnl:+.2f} USDT"],
@@ -902,21 +940,19 @@ def main():
     scenario_stats("D",  "D) Широкий стоп 50% от объёма позиции")
     scenario_stats("E",  "E) 48ч управление (троллинг + динамический SL)")
 
-    # ── Статистика без DCA ────────────────────────────────────
+    # ── Статистика без усреднения (ND_* колонки) ──────────────
     report.append("═" * 60)
-    report.append("     СТАТИСТИКА БЕЗ УЧЁТА УСРЕДНЕНИЙ")
+    report.append(f"     СТАТИСТИКА БЕЗ УСРЕДНЕНИЯ (все {len(df_clean)} сделки, позиция всегда {POSITION_USDT:.0f} USDT)")
     report.append("═" * 60)
-    df_no_dca = df_clean[df_clean["has_dca"] == False]
-    report.append(f"Сделок без DCA: {len(df_no_dca)}")
     report.append("")
 
-    scenario_stats("A",   "A) Базовый (без троллинга стопа)", data=df_no_dca)
-    scenario_stats("B",   "B) Троллинг стопа (б/у после TP1, TP1 после TP2)", data=df_no_dca)
-    scenario_stats("C5",  "C) SL после TP1: -5% от входа", data=df_no_dca)
-    scenario_stats("C10", "C) SL после TP1: -10% от входа", data=df_no_dca)
-    scenario_stats("C15", "C) SL после TP1: -15% от входа", data=df_no_dca)
-    scenario_stats("D",   "D) Широкий стоп 50% от объёма позиции", data=df_no_dca)
-    scenario_stats("E",   "E) 48ч управление (троллинг + динамический SL)", data=df_no_dca)
+    scenario_stats("ND_A",   "A) Базовый (без троллинга стопа)")
+    scenario_stats("ND_B",   "B) Троллинг стопа (б/у после TP1, TP1 после TP2)")
+    scenario_stats("ND_C5",  "C) SL после TP1: -5% от входа")
+    scenario_stats("ND_C10", "C) SL после TP1: -10% от входа")
+    scenario_stats("ND_C15", "C) SL после TP1: -15% от входа")
+    scenario_stats("ND_D",   "D) Широкий стоп 50% от объёма позиции")
+    scenario_stats("ND_E",   "E) 48ч управление (троллинг + динамический SL)")
 
     # Зависимости
     report.append("── Зависимость: размер стопа vs результат ─────────────")
