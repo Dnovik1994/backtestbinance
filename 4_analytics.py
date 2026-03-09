@@ -14,6 +14,7 @@
 """
 
 import csv
+import hashlib
 import os
 import time
 import json
@@ -938,252 +939,279 @@ def _empty_result(reason: str = "NO_DATA"):
 # ===========================
 # Главный цикл
 # ===========================
+def _md5(path):
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+CACHE_MD5_FILE = "backtest_cache.md5"
+
+
 def main():
-    with open(INPUT_FILE, encoding="utf-8") as f:
-        trades = list(csv.DictReader(f))
+    skip_simulation = False
 
-    # Берём только сделки с закрытием (не still_open и не new_signal_opened без данных)
-    valid = [t for t in trades if t["entry_price"]]
-    print(f"Всего сделок: {len(trades)} | К анализу: {len(valid)}")
+    if os.path.exists(OUTPUT_CSV) and os.path.exists(CACHE_MD5_FILE):
+        saved_hash = open(CACHE_MD5_FILE).read().strip()
+        current_hash = _md5(INPUT_FILE)
+        if saved_hash == current_hash:
+            answer = input(f"\nbacktest_full.csv актуален (trades.csv не изменился). Пересчитать симуляцию? [y/N]: ").strip().lower()
+            if answer != "y":
+                print("  → загружаем готовые результаты...")
+                df_clean = pd.read_csv(OUTPUT_CSV)
+                skip_simulation = True
 
-    results  = []
-    invalids = []  # сделки с опечатками/аномалиями
+    if not skip_simulation:
+        with open(INPUT_FILE, encoding="utf-8") as f:
+            trades = list(csv.DictReader(f))
 
-    for i, trade in enumerate(valid):
-        sym    = trade["symbol"]
-        ts_str = trade["signal_ts"]
-        side   = trade["side"]
-        entry  = trade["entry_price"]
+        # Берём только сделки с закрытием (не still_open и не new_signal_opened без данных)
+        valid = [t for t in trades if t["entry_price"]]
+        print(f"Всего сделок: {len(trades)} | К анализу: {len(valid)}")
 
-        try:
-            dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-            ts_ms = int(dt.timestamp() * 1000)
-        except Exception:
-            continue
+        results  = []
+        invalids = []  # сделки с опечатками/аномалиями
 
-        print(f"[{i+1}/{len(valid)}] {sym} {side} @ {entry} ({ts_str})")
+        for i, trade in enumerate(valid):
+            sym    = trade["symbol"]
+            ts_str = trade["signal_ts"]
+            side   = trade["side"]
+            entry  = trade["entry_price"]
 
-        # Загружаем свечи — полный горизонт MAX_DAYS для корректного кэширования
-        df = get_klines_until_close(sym, ts_ms)
-        sim = simulate(trade, df)
-        sim_nd = simulate(trade, df, force_no_dca=True)
+            try:
+                dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                ts_ms = int(dt.timestamp() * 1000)
+            except Exception:
+                continue
 
-        # Если сделка невалидная (опечатка) — пишем в отдельный файл
-        if sim["base"]["outcome"] == "INVALID_SL":
-            sl_val  = float(trade["sl"]) if trade["sl"] else 0
-            en_val  = float(entry) if entry else 1
+            print(f"[{i+1}/{len(valid)}] {sym} {side} @ {entry} ({ts_str})")
+
+            # Загружаем свечи — полный горизонт MAX_DAYS для корректного кэширования
+            df = get_klines_until_close(sym, ts_ms)
+            sim = simulate(trade, df)
+            sim_nd = simulate(trade, df, force_no_dca=True)
+
+            # Если сделка невалидная (опечатка) — пишем в отдельный файл
+            if sim["base"]["outcome"] == "INVALID_SL":
+                sl_val  = float(trade["sl"]) if trade["sl"] else 0
+                en_val  = float(entry) if entry else 1
+                invalids.append({
+                    "msg_id":    trade["signal_msg_id"],
+                    "ts":        ts_str,
+                    "symbol":    sym,
+                    "side":      side,
+                    "entry":     entry,
+                    "tp1":       trade["tp1"],
+                    "tp2":       trade["tp2"],
+                    "tp3":       trade["tp3"],
+                    "sl":        trade["sl"],
+                    "sl_dist_pct": f"{abs(sl_val - en_val) / en_val * 100:.1f}%",
+                    "reason":    "SL дальше 20% от entry — возможна опечатка",
+                })
+                continue
+
+            row = {
+                "msg_id":       trade["signal_msg_id"],
+                "ts":           ts_str,
+                "symbol":       sym,
+                "side":         side,
+                "entry":        entry,
+                "tp1":          trade["tp1"],
+                "tp2":          trade["tp2"],
+                "tp3":          trade["tp3"],
+                "sl":           trade["sl"],
+                "has_dca":      sim["has_dca"],
+                "total_usdt":   sim["total_usdt"],
+
+                # Сценарий A: Базовый
+                "A_outcome":    sim["base"]["outcome"],
+                "A_tps_hit":    sim["base"]["tps_hit"],
+                "A_pnl":        sim["base"]["pnl"],
+                "A_roi":        sim["base"]["roi"],
+                "A_candles":    sim["base"]["candles"],
+
+                # Сценарий B: Троллинг стопа
+                "B_outcome":    sim["trail"]["outcome"],
+                "B_tps_hit":    sim["trail"]["tps_hit"],
+                "B_pnl":        sim["trail"]["pnl"],
+                "B_roi":        sim["trail"]["roi"],
+
+                # Сценарий C: SL после TP1 -5%/-10%/-15%
+                "C5_outcome":   sim["sl_after_tp1_5pct"]["outcome"],
+                "C5_tps_hit":   sim["sl_after_tp1_5pct"]["tps_hit"],
+                "C5_pnl":       sim["sl_after_tp1_5pct"]["pnl"],
+                "C5_roi":       sim["sl_after_tp1_5pct"]["roi"],
+
+                "C10_outcome":  sim["sl_after_tp1_10pct"]["outcome"],
+                "C10_tps_hit":  sim["sl_after_tp1_10pct"]["tps_hit"],
+                "C10_pnl":      sim["sl_after_tp1_10pct"]["pnl"],
+                "C10_roi":      sim["sl_after_tp1_10pct"]["roi"],
+
+                "C15_outcome":  sim["sl_after_tp1_15pct"]["outcome"],
+                "C15_tps_hit":  sim["sl_after_tp1_15pct"]["tps_hit"],
+                "C15_pnl":      sim["sl_after_tp1_15pct"]["pnl"],
+                "C15_roi":      sim["sl_after_tp1_15pct"]["roi"],
+
+                # Сценарий D: Широкий стоп 50%
+                "D_outcome":    sim["wide_sl"]["outcome"],
+                "D_tps_hit":    sim["wide_sl"]["tps_hit"],
+                "D_pnl":        sim["wide_sl"]["pnl"],
+                "D_roi":        sim["wide_sl"]["roi"],
+
+                # Сценарий E: 48-часовое управление
+                "E_outcome":    sim["48h"]["outcome"],
+                "E_tps_hit":    sim["48h"]["tps_hit"],
+                "E_pnl":        sim["48h"]["pnl"],
+                "E_roi":        sim["48h"]["roi"],
+                "E_candles":    sim["48h"]["candles"],
+
+                # Сценарий E1: как E, но фаза 2 с 24ч
+                "E1_outcome":   sim["24h"]["outcome"],
+                "E1_tps_hit":   sim["24h"]["tps_hit"],
+                "E1_pnl":       sim["24h"]["pnl"],
+                "E1_roi":       sim["24h"]["roi"],
+                "E1_candles":   sim["24h"]["candles"],
+
+                # Сценарий F: Широкий стоп + веса 70/20/10 + троллинг -15% ROI
+                "F_outcome":    sim["f"]["outcome"],
+                "F_tps_hit":    sim["f"]["tps_hit"],
+                "F_pnl":        sim["f"]["pnl"],
+                "F_roi":        sim["f"]["roi"],
+
+                # Сценарий G: Фильтр SL>5%
+                "G_outcome":    sim["g"]["outcome"],
+                "G_tps_hit":    sim["g"]["tps_hit"],
+                "G_pnl":        sim["g"]["pnl"],
+                "G_roi":        sim["g"]["roi"],
+
+                # Сценарий F1: F + фильтр SL>5%
+                "F1_outcome":   sim["f1"]["outcome"],
+                "F1_tps_hit":   sim["f1"]["tps_hit"],
+                "F1_pnl":       sim["f1"]["pnl"],
+                "F1_roi":       sim["f1"]["roi"],
+                # Сценарий H: DCA только если цена ушла >2%
+                "H_outcome":    sim["h"]["outcome"],
+                "H_tps_hit":    sim["h"]["tps_hit"],
+                "H_pnl":        sim["h"]["pnl"],
+                "H_roi":        sim["h"]["roi"],
+
+                # Вероятность направления
+                "dir_5m":       sim["direction"].get("dir_5m"),
+                "dir_15m":      sim["direction"].get("dir_15m"),
+                "dir_30m":      sim["direction"].get("dir_30m"),
+                "dir_60m":      sim["direction"].get("dir_60m"),
+
+                # ND (No DCA) — пересчёт всех сценариев с позицией = POSITION_USDT
+                "ND_A_outcome":    sim_nd["base"]["outcome"],
+                "ND_A_tps_hit":    sim_nd["base"]["tps_hit"],
+                "ND_A_pnl":        sim_nd["base"]["pnl"],
+                "ND_A_roi":        sim_nd["base"]["roi"],
+                "ND_A_candles":    sim_nd["base"]["candles"],
+
+                "ND_B_outcome":    sim_nd["trail"]["outcome"],
+                "ND_B_tps_hit":    sim_nd["trail"]["tps_hit"],
+                "ND_B_pnl":        sim_nd["trail"]["pnl"],
+                "ND_B_roi":        sim_nd["trail"]["roi"],
+
+                "ND_C5_outcome":   sim_nd["sl_after_tp1_5pct"]["outcome"],
+                "ND_C5_tps_hit":   sim_nd["sl_after_tp1_5pct"]["tps_hit"],
+                "ND_C5_pnl":       sim_nd["sl_after_tp1_5pct"]["pnl"],
+                "ND_C5_roi":       sim_nd["sl_after_tp1_5pct"]["roi"],
+
+                "ND_C10_outcome":  sim_nd["sl_after_tp1_10pct"]["outcome"],
+                "ND_C10_tps_hit":  sim_nd["sl_after_tp1_10pct"]["tps_hit"],
+                "ND_C10_pnl":      sim_nd["sl_after_tp1_10pct"]["pnl"],
+                "ND_C10_roi":      sim_nd["sl_after_tp1_10pct"]["roi"],
+
+                "ND_C15_outcome":  sim_nd["sl_after_tp1_15pct"]["outcome"],
+                "ND_C15_tps_hit":  sim_nd["sl_after_tp1_15pct"]["tps_hit"],
+                "ND_C15_pnl":      sim_nd["sl_after_tp1_15pct"]["pnl"],
+                "ND_C15_roi":      sim_nd["sl_after_tp1_15pct"]["roi"],
+
+                "ND_D_outcome":    sim_nd["wide_sl"]["outcome"],
+                "ND_D_tps_hit":    sim_nd["wide_sl"]["tps_hit"],
+                "ND_D_pnl":        sim_nd["wide_sl"]["pnl"],
+                "ND_D_roi":        sim_nd["wide_sl"]["roi"],
+
+                "ND_E_outcome":    sim_nd["48h"]["outcome"],
+                "ND_E_tps_hit":    sim_nd["48h"]["tps_hit"],
+                "ND_E_pnl":        sim_nd["48h"]["pnl"],
+                "ND_E_roi":        sim_nd["48h"]["roi"],
+                "ND_E_candles":    sim_nd["48h"]["candles"],
+
+                "ND_E1_outcome":   sim_nd["24h"]["outcome"],
+                "ND_E1_tps_hit":   sim_nd["24h"]["tps_hit"],
+                "ND_E1_pnl":       sim_nd["24h"]["pnl"],
+                "ND_E1_roi":       sim_nd["24h"]["roi"],
+                "ND_E1_candles":   sim_nd["24h"]["candles"],
+
+                "ND_F_outcome":    sim_nd["f"]["outcome"],
+                "ND_F_tps_hit":    sim_nd["f"]["tps_hit"],
+                "ND_F_pnl":        sim_nd["f"]["pnl"],
+                "ND_F_roi":        sim_nd["f"]["roi"],
+
+                "ND_G_outcome":    sim_nd["g"]["outcome"],
+                "ND_G_tps_hit":    sim_nd["g"]["tps_hit"],
+                "ND_G_pnl":        sim_nd["g"]["pnl"],
+                "ND_G_roi":        sim_nd["g"]["roi"],
+
+                "ND_F1_outcome":   sim_nd["f1"]["outcome"],
+                "ND_F1_tps_hit":   sim_nd["f1"]["tps_hit"],
+                "ND_F1_pnl":       sim_nd["f1"]["pnl"],
+                "ND_F1_roi":       sim_nd["f1"]["roi"],
+                "ND_H_outcome":    sim_nd["h"]["outcome"],
+                "ND_H_tps_hit":    sim_nd["h"]["tps_hit"],
+                "ND_H_pnl":        sim_nd["h"]["pnl"],
+                "ND_H_roi":        sim_nd["h"]["roi"],
+            }
+            results.append(row)
+            time.sleep(0.25)
+
+        if not results:
+            print("Нет результатов.")
+            return
+
+        df_res = pd.DataFrame(results)
+
+        # Переносим только чистые TIMEOUT в invalid (закрыты вручную без сообщения в канале)
+        # TP1_TIMEOUT и TP2_TIMEOUT — реальные частичные прибыли, их оставляем
+        timeout_mask = df_res["A_outcome"] == "TIMEOUT"
+        df_timeout = df_res[timeout_mask].copy()
+        df_clean   = df_res[~timeout_mask].copy()
+
+        for _, r in df_timeout.iterrows():
             invalids.append({
-                "msg_id":    trade["signal_msg_id"],
-                "ts":        ts_str,
-                "symbol":    sym,
-                "side":      side,
-                "entry":     entry,
-                "tp1":       trade["tp1"],
-                "tp2":       trade["tp2"],
-                "tp3":       trade["tp3"],
-                "sl":        trade["sl"],
-                "sl_dist_pct": f"{abs(sl_val - en_val) / en_val * 100:.1f}%",
-                "reason":    "SL дальше 20% от entry — возможна опечатка",
+                "msg_id":    r["msg_id"],
+                "ts":        r["ts"],
+                "symbol":    r["symbol"],
+                "side":      r["side"],
+                "entry":     r["entry"],
+                "tp1":       r["tp1"],
+                "tp2":       r["tp2"],
+                "tp3":       r["tp3"],
+                "sl":        r["sl"],
+                "sl_dist_pct": "—",
+                "reason":    f"MANUAL_CLOSE — не закрылась за {MAX_DAYS} дней, вероятно закрыта вручную",
             })
-            continue
 
-        row = {
-            "msg_id":       trade["signal_msg_id"],
-            "ts":           ts_str,
-            "symbol":       sym,
-            "side":         side,
-            "entry":        entry,
-            "tp1":          trade["tp1"],
-            "tp2":          trade["tp2"],
-            "tp3":          trade["tp3"],
-            "sl":           trade["sl"],
-            "has_dca":      sim["has_dca"],
-            "total_usdt":   sim["total_usdt"],
+        df_clean.to_csv(OUTPUT_CSV, index=False, encoding="utf-8")
 
-            # Сценарий A: Базовый
-            "A_outcome":    sim["base"]["outcome"],
-            "A_tps_hit":    sim["base"]["tps_hit"],
-            "A_pnl":        sim["base"]["pnl"],
-            "A_roi":        sim["base"]["roi"],
-            "A_candles":    sim["base"]["candles"],
+        # Сохраняем невалидные сделки
+        if invalids:
+            df_inv = pd.DataFrame(invalids)
+            df_inv.to_csv(INVALID_FILE, index=False, encoding="utf-8")
+            invalid_sl      = sum(1 for x in invalids if "SL" in x["reason"] and "MANUAL" not in x["reason"])
+            invalid_timeout = sum(1 for x in invalids if "MANUAL_CLOSE" in x["reason"])
+            print(f"\n⚠️  Невалидных сделок: {len(invalids)} → {INVALID_FILE}")
+            print(f"   Опечатки (SL >20%):  {invalid_sl}")
+            print(f"   Ручное закрытие:     {invalid_timeout}")
+        else:
+            print("\n✅ Невалидных сделок не найдено")
 
-            # Сценарий B: Троллинг стопа
-            "B_outcome":    sim["trail"]["outcome"],
-            "B_tps_hit":    sim["trail"]["tps_hit"],
-            "B_pnl":        sim["trail"]["pnl"],
-            "B_roi":        sim["trail"]["roi"],
 
-            # Сценарий C: SL после TP1 -5%/-10%/-15%
-            "C5_outcome":   sim["sl_after_tp1_5pct"]["outcome"],
-            "C5_tps_hit":   sim["sl_after_tp1_5pct"]["tps_hit"],
-            "C5_pnl":       sim["sl_after_tp1_5pct"]["pnl"],
-            "C5_roi":       sim["sl_after_tp1_5pct"]["roi"],
-
-            "C10_outcome":  sim["sl_after_tp1_10pct"]["outcome"],
-            "C10_tps_hit":  sim["sl_after_tp1_10pct"]["tps_hit"],
-            "C10_pnl":      sim["sl_after_tp1_10pct"]["pnl"],
-            "C10_roi":      sim["sl_after_tp1_10pct"]["roi"],
-
-            "C15_outcome":  sim["sl_after_tp1_15pct"]["outcome"],
-            "C15_tps_hit":  sim["sl_after_tp1_15pct"]["tps_hit"],
-            "C15_pnl":      sim["sl_after_tp1_15pct"]["pnl"],
-            "C15_roi":      sim["sl_after_tp1_15pct"]["roi"],
-
-            # Сценарий D: Широкий стоп 50%
-            "D_outcome":    sim["wide_sl"]["outcome"],
-            "D_tps_hit":    sim["wide_sl"]["tps_hit"],
-            "D_pnl":        sim["wide_sl"]["pnl"],
-            "D_roi":        sim["wide_sl"]["roi"],
-
-            # Сценарий E: 48-часовое управление
-            "E_outcome":    sim["48h"]["outcome"],
-            "E_tps_hit":    sim["48h"]["tps_hit"],
-            "E_pnl":        sim["48h"]["pnl"],
-            "E_roi":        sim["48h"]["roi"],
-            "E_candles":    sim["48h"]["candles"],
-
-            # Сценарий E1: как E, но фаза 2 с 24ч
-            "E1_outcome":   sim["24h"]["outcome"],
-            "E1_tps_hit":   sim["24h"]["tps_hit"],
-            "E1_pnl":       sim["24h"]["pnl"],
-            "E1_roi":       sim["24h"]["roi"],
-            "E1_candles":   sim["24h"]["candles"],
-
-            # Сценарий F: Широкий стоп + веса 70/20/10 + троллинг -15% ROI
-            "F_outcome":    sim["f"]["outcome"],
-            "F_tps_hit":    sim["f"]["tps_hit"],
-            "F_pnl":        sim["f"]["pnl"],
-            "F_roi":        sim["f"]["roi"],
-
-            # Сценарий G: Фильтр SL>5%
-            "G_outcome":    sim["g"]["outcome"],
-            "G_tps_hit":    sim["g"]["tps_hit"],
-            "G_pnl":        sim["g"]["pnl"],
-            "G_roi":        sim["g"]["roi"],
-
-            # Сценарий F1: F + фильтр SL>5%
-            "F1_outcome":   sim["f1"]["outcome"],
-            "F1_tps_hit":   sim["f1"]["tps_hit"],
-            "F1_pnl":       sim["f1"]["pnl"],
-            "F1_roi":       sim["f1"]["roi"],
-            # Сценарий H: DCA только если цена ушла >2%
-            "H_outcome":    sim["h"]["outcome"],
-            "H_tps_hit":    sim["h"]["tps_hit"],
-            "H_pnl":        sim["h"]["pnl"],
-            "H_roi":        sim["h"]["roi"],
-
-            # Вероятность направления
-            "dir_5m":       sim["direction"].get("dir_5m"),
-            "dir_15m":      sim["direction"].get("dir_15m"),
-            "dir_30m":      sim["direction"].get("dir_30m"),
-            "dir_60m":      sim["direction"].get("dir_60m"),
-
-            # ND (No DCA) — пересчёт всех сценариев с позицией = POSITION_USDT
-            "ND_A_outcome":    sim_nd["base"]["outcome"],
-            "ND_A_tps_hit":    sim_nd["base"]["tps_hit"],
-            "ND_A_pnl":        sim_nd["base"]["pnl"],
-            "ND_A_roi":        sim_nd["base"]["roi"],
-            "ND_A_candles":    sim_nd["base"]["candles"],
-
-            "ND_B_outcome":    sim_nd["trail"]["outcome"],
-            "ND_B_tps_hit":    sim_nd["trail"]["tps_hit"],
-            "ND_B_pnl":        sim_nd["trail"]["pnl"],
-            "ND_B_roi":        sim_nd["trail"]["roi"],
-
-            "ND_C5_outcome":   sim_nd["sl_after_tp1_5pct"]["outcome"],
-            "ND_C5_tps_hit":   sim_nd["sl_after_tp1_5pct"]["tps_hit"],
-            "ND_C5_pnl":       sim_nd["sl_after_tp1_5pct"]["pnl"],
-            "ND_C5_roi":       sim_nd["sl_after_tp1_5pct"]["roi"],
-
-            "ND_C10_outcome":  sim_nd["sl_after_tp1_10pct"]["outcome"],
-            "ND_C10_tps_hit":  sim_nd["sl_after_tp1_10pct"]["tps_hit"],
-            "ND_C10_pnl":      sim_nd["sl_after_tp1_10pct"]["pnl"],
-            "ND_C10_roi":      sim_nd["sl_after_tp1_10pct"]["roi"],
-
-            "ND_C15_outcome":  sim_nd["sl_after_tp1_15pct"]["outcome"],
-            "ND_C15_tps_hit":  sim_nd["sl_after_tp1_15pct"]["tps_hit"],
-            "ND_C15_pnl":      sim_nd["sl_after_tp1_15pct"]["pnl"],
-            "ND_C15_roi":      sim_nd["sl_after_tp1_15pct"]["roi"],
-
-            "ND_D_outcome":    sim_nd["wide_sl"]["outcome"],
-            "ND_D_tps_hit":    sim_nd["wide_sl"]["tps_hit"],
-            "ND_D_pnl":        sim_nd["wide_sl"]["pnl"],
-            "ND_D_roi":        sim_nd["wide_sl"]["roi"],
-
-            "ND_E_outcome":    sim_nd["48h"]["outcome"],
-            "ND_E_tps_hit":    sim_nd["48h"]["tps_hit"],
-            "ND_E_pnl":        sim_nd["48h"]["pnl"],
-            "ND_E_roi":        sim_nd["48h"]["roi"],
-            "ND_E_candles":    sim_nd["48h"]["candles"],
-
-            "ND_E1_outcome":   sim_nd["24h"]["outcome"],
-            "ND_E1_tps_hit":   sim_nd["24h"]["tps_hit"],
-            "ND_E1_pnl":       sim_nd["24h"]["pnl"],
-            "ND_E1_roi":       sim_nd["24h"]["roi"],
-            "ND_E1_candles":   sim_nd["24h"]["candles"],
-
-            "ND_F_outcome":    sim_nd["f"]["outcome"],
-            "ND_F_tps_hit":    sim_nd["f"]["tps_hit"],
-            "ND_F_pnl":        sim_nd["f"]["pnl"],
-            "ND_F_roi":        sim_nd["f"]["roi"],
-
-            "ND_G_outcome":    sim_nd["g"]["outcome"],
-            "ND_G_tps_hit":    sim_nd["g"]["tps_hit"],
-            "ND_G_pnl":        sim_nd["g"]["pnl"],
-            "ND_G_roi":        sim_nd["g"]["roi"],
-
-            "ND_F1_outcome":   sim_nd["f1"]["outcome"],
-            "ND_F1_tps_hit":   sim_nd["f1"]["tps_hit"],
-            "ND_F1_pnl":       sim_nd["f1"]["pnl"],
-            "ND_F1_roi":       sim_nd["f1"]["roi"],
-            "ND_H_outcome":    sim_nd["h"]["outcome"],
-            "ND_H_tps_hit":    sim_nd["h"]["tps_hit"],
-            "ND_H_pnl":        sim_nd["h"]["pnl"],
-            "ND_H_roi":        sim_nd["h"]["roi"],
-        }
-        results.append(row)
-        time.sleep(0.25)
-
-    if not results:
-        print("Нет результатов.")
-        return
-
-    df_res = pd.DataFrame(results)
-
-    # Переносим только чистые TIMEOUT в invalid (закрыты вручную без сообщения в канале)
-    # TP1_TIMEOUT и TP2_TIMEOUT — реальные частичные прибыли, их оставляем
-    timeout_mask = df_res["A_outcome"] == "TIMEOUT"
-    df_timeout = df_res[timeout_mask].copy()
-    df_clean   = df_res[~timeout_mask].copy()
-
-    for _, r in df_timeout.iterrows():
-        invalids.append({
-            "msg_id":    r["msg_id"],
-            "ts":        r["ts"],
-            "symbol":    r["symbol"],
-            "side":      r["side"],
-            "entry":     r["entry"],
-            "tp1":       r["tp1"],
-            "tp2":       r["tp2"],
-            "tp3":       r["tp3"],
-            "sl":        r["sl"],
-            "sl_dist_pct": "—",
-            "reason":    f"MANUAL_CLOSE — не закрылась за {MAX_DAYS} дней, вероятно закрыта вручную",
-        })
-
-    df_clean.to_csv(OUTPUT_CSV, index=False, encoding="utf-8")
-
-    # Сохраняем невалидные сделки
-    if invalids:
-        df_inv = pd.DataFrame(invalids)
-        df_inv.to_csv(INVALID_FILE, index=False, encoding="utf-8")
-        invalid_sl      = sum(1 for x in invalids if "SL" in x["reason"] and "MANUAL" not in x["reason"])
-        invalid_timeout = sum(1 for x in invalids if "MANUAL_CLOSE" in x["reason"])
-        print(f"\n⚠️  Невалидных сделок: {len(invalids)} → {INVALID_FILE}")
-        print(f"   Опечатки (SL >20%):  {invalid_sl}")
-        print(f"   Ручное закрытие:     {invalid_timeout}")
-    else:
-        print("\n✅ Невалидных сделок не найдено")
+        open(CACHE_MD5_FILE, "w").write(_md5(INPUT_FILE))
 
     # ===========================
     # Формируем отчёт
@@ -1193,7 +1221,8 @@ def main():
     report.append("         ПОЛНЫЙ АНАЛИТИЧЕСКИЙ ОТЧЁТ ПО КАНАЛУ")
     report.append("=" * 60)
     report.append(f"Сделок проанализировано: {len(df_clean)}")
-    report.append(f"  (исключено TIMEOUT/ручное закрытие: {len(df_timeout)})")
+    if not skip_simulation:
+        report.append(f"  (исключено TIMEOUT/ручное закрытие: {len(df_timeout)})")
     report.append(f"Объём позиции: {POSITION_USDT} USDT (при усреднении +{DCA_USDT} USDT)")
     report.append(f"Плечо: x{LEVERAGE}")
     report.append("")
@@ -1208,8 +1237,12 @@ def main():
 
         # Winrate: победа = достигнут хотя бы один TP (включая SL_after_TP*)
         # Поражение = чистый SL (не достигнут ни один TP)
+        wins = pd.Series(dtype=bool)
+        losses = pd.Series(dtype=bool)
         if col_prefix in ("E", "ND_E"):
             loss_mask = outcome_col.isin(["E_SL", "E_SL_dynamic"])
+            losses = sub[loss_mask]
+            wins   = sub[~loss_mask]
         elif col_prefix in ("E1", "ND_E1"):
             loss_mask = outcome_col.isin(["E1_SL", "E1_SL_dynamic"])
             losses = sub[loss_mask]
