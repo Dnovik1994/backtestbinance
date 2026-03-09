@@ -220,8 +220,9 @@ def simulate(row: Dict, df: pd.DataFrame, force_no_dca: bool = False) -> Dict[st
     variants_c = {}
     for pct in SL_AFTER_TP1_VARIANTS:
         sl_new = entry * (1 - pct / LEVERAGE) if side == "BUY" else entry * (1 + pct / LEVERAGE)
+        sl_tp2 = tp_prices[0] * (1 - pct / LEVERAGE) if side == "BUY" else tp_prices[0] * (1 + pct / LEVERAGE) if tp_prices else None
         variants_c[f"sl_after_tp1_{int(abs(pct)*100)}pct"] = _sim_trailing_custom(
-            df, side, entry, tp_prices, sl, sl_new, total_usdt
+            df, side, entry, tp_prices, sl, sl_new, total_usdt, sl_after_tp2=sl_tp2
         )
 
     # ── Сценарий D: Широкий стоп 50% от объёма ───────────────
@@ -312,7 +313,8 @@ def simulate(row: Dict, df: pd.DataFrame, force_no_dca: bool = False) -> Dict[st
                                  timeout_candles=TIMEOUT_CANDLES, timeout_outcome="B_T_timeout")
     result_c15_t = _sim_trailing_custom(df, side, entry, tp_prices, sl,
                                         entry * (1 - 0.15 / LEVERAGE) if side == "BUY" else entry * (1 + 0.15 / LEVERAGE),
-                                        total_usdt, timeout_candles=TIMEOUT_CANDLES, timeout_outcome="C15_T_timeout")
+                                        total_usdt, timeout_candles=TIMEOUT_CANDLES, timeout_outcome="C15_T_timeout",
+                                        sl_after_tp2=tp_prices[0] * (1 - 0.15 / LEVERAGE) if side == "BUY" else tp_prices[0] * (1 + 0.15 / LEVERAGE))
     result_d_t   = _sim_base(df, side, entry, tp_prices, sl_wide, total_usdt,
                              timeout_candles=TIMEOUT_CANDLES, timeout_outcome="D_T_timeout")
     result_f_t   = _sim_f(df, side, entry, tp_prices, sl_wide, total_usdt,
@@ -551,9 +553,10 @@ def _sim_trailing(df, side, entry, tp_prices, sl_orig, total_usdt, timeout_candl
     }
 
 
-def _sim_trailing_custom(df, side, entry, tp_prices, sl_orig, sl_after_tp1, total_usdt, timeout_candles=None, timeout_outcome=None):
+def _sim_trailing_custom(df, side, entry, tp_prices, sl_orig, sl_after_tp1, total_usdt, timeout_candles=None, timeout_outcome=None, sl_after_tp2=None):
     """
     Троллинг с кастомным SL после TP1 (например entry -5%).
+    После TP2 — SL троллится на sl_after_tp2 (если задан), иначе на TP1.
     """
     n       = len(tp_prices)
     weights = _norm_weights(TP_WEIGHTS, n)
@@ -581,7 +584,7 @@ def _sim_trailing_custom(df, side, entry, tp_prices, sl_orig, sl_after_tp1, tota
                 if tps_hit == 1:
                     current_sl = sl_after_tp1
                 elif tps_hit == 2 and len(tp_prices) >= 1:
-                    current_sl = tp_prices[0]
+                    current_sl = sl_after_tp2 if sl_after_tp2 is not None else tp_prices[0]
             else:
                 break
 
@@ -644,6 +647,8 @@ def _sim_f(df, side, entry, tp_prices, sl_wide, total_usdt, timeout_candles=None
 
     # SL после TP1: -15% ROI от entry
     sl_after_tp1 = entry * (1 - 0.15 / LEVERAGE) if side == "BUY" else entry * (1 + 0.15 / LEVERAGE)
+    # SL после TP2: -15% ROI от entry, но база — TP1
+    sl_after_tp2 = tp_prices[0] * (1 - 0.15 / LEVERAGE) if side == "BUY" else tp_prices[0] * (1 + 0.15 / LEVERAGE)
 
     for _, row in df.iterrows():
         candles += 1
@@ -660,7 +665,7 @@ def _sim_f(df, side, entry, tp_prices, sl_wide, total_usdt, timeout_candles=None
                 if tps_hit == 1:
                     current_sl = sl_after_tp1
                 elif tps_hit == 2 and len(tp_prices) >= 1:
-                    current_sl = tp_prices[0]
+                    current_sl = sl_after_tp2
             else:
                 break
 
