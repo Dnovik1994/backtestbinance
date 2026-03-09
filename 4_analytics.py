@@ -555,9 +555,9 @@ def _sim_48h(df, side, entry, tp_prices, sl_orig, total_usdt):
         # Логика: чем глубже убыток, тем шире стоп, чтобы дать позиции
         # пространство для восстановления:
         #   ROI < −40%  → SL снимается полностью (ждём до 48ч, не режем)
-        #   ROI < −30%  → SL = entry ± 41% (очень широкий стоп)
-        #   ROI < −20%  → SL = entry ± 31% (средний стоп)
-        #   ROI ≥ −20%  → SL = entry ± 21% (стандартный стоп)
+        #   ROI < −30%  → SL = entry ± 41%/LEVERAGE (ROI -41%)
+        #   ROI < −20%  → SL = entry ± 31%/LEVERAGE (ROI -31%)
+        #   ROI ≥ −20%  → SL = entry ± 21%/LEVERAGE (ROI -21%)
         # Знак ± зависит от направления: BUY — минус, SELL — плюс.
         # После первого TP переключаемся на троллинг-стоп (else-ветка).
         if not sl_locked:
@@ -566,23 +566,23 @@ def _sim_48h(df, side, entry, tp_prices, sl_orig, total_usdt):
                 # Глубокая просадка (>40%) — SL не ставим, ждём таймаут 48ч
                 current_sl_dynamic = None
             elif current_roi < -30:
-                # Просадка 30–40% — очень широкий стоп (41% от entry)
+                # Просадка 30–40% — очень широкий стоп (ROI -41%)
                 if side == "BUY":
-                    current_sl_dynamic = entry * (1 - 0.41)
+                    current_sl_dynamic = entry * (1 - 0.41 / LEVERAGE)
                 else:
-                    current_sl_dynamic = entry * (1 + 0.41)
+                    current_sl_dynamic = entry * (1 + 0.41 / LEVERAGE)
             elif current_roi < -20:
-                # Просадка 20–30% — средний стоп (31% от entry)
+                # Просадка 20–30% — средний стоп (ROI -31%)
                 if side == "BUY":
-                    current_sl_dynamic = entry * (1 - 0.31)
+                    current_sl_dynamic = entry * (1 - 0.31 / LEVERAGE)
                 else:
-                    current_sl_dynamic = entry * (1 + 0.31)
+                    current_sl_dynamic = entry * (1 + 0.31 / LEVERAGE)
             else:
-                # Просадка < 20% или позиция в плюсе — стандартный стоп (21% от entry)
+                # Просадка < 20% или позиция в плюсе — стандартный стоп (ROI -21%)
                 if side == "BUY":
-                    current_sl_dynamic = entry * (1 - 0.21)
+                    current_sl_dynamic = entry * (1 - 0.21 / LEVERAGE)
                 else:
-                    current_sl_dynamic = entry * (1 + 0.21)
+                    current_sl_dynamic = entry * (1 + 0.21 / LEVERAGE)
 
             active_sl = current_sl_dynamic
         else:
