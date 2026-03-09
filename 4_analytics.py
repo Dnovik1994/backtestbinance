@@ -869,13 +869,14 @@ def main():
         total   = len(sub)
         outcome_col = sub[f"{col_prefix}_outcome"]
 
-        # Winrate: для E/ND_E — победа = НЕ E_SL* и НЕ E_liquidation
+        # Winrate: победа = достигнут хотя бы один TP (включая SL_after_TP*)
+        # Поражение = чистый SL (не достигнут ни один TP)
         if col_prefix in ("E", "ND_E"):
-            wins   = sub[~outcome_col.str.startswith("E_SL") & (outcome_col != "E_liquidation")]
-            losses = sub[outcome_col.str.startswith("E_SL") | (outcome_col == "E_liquidation")]
+            losses = sub[(outcome_col == "E_SL") | (outcome_col == "E_liquidation")]
+            wins   = sub[~((outcome_col == "E_SL") | (outcome_col == "E_liquidation"))]
         else:
-            wins   = sub[~outcome_col.str.startswith("SL")]
-            losses = sub[outcome_col.str.startswith("SL")]
+            losses = sub[outcome_col == "SL"]
+            wins   = sub[outcome_col != "SL"]
 
         winrate = len(wins) / total * 100 if total else 0
         total_pnl = sub[f"{col_prefix}_pnl"].sum()
@@ -936,7 +937,7 @@ def main():
     df_clean["sl_bucket"] = pd.cut(df_clean["sl_dist_pct"], bins=bins, labels=labels)
     sl_analysis = df_clean.groupby("sl_bucket", observed=True).agg(
         count=("A_pnl", "count"),
-        winrate=("A_outcome", lambda x: (x != "SL").mean() * 100),
+        winrate=("A_outcome", lambda x: (x != "SL").mean() * 100),  # SL = чистый стоп
         avg_pnl=("A_pnl", "mean"),
     ).round(2)
     report.append(tabulate(sl_analysis, headers="keys", tablefmt="simple"))
