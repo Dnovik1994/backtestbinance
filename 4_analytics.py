@@ -231,6 +231,9 @@ def simulate(row: Dict, df: pd.DataFrame, force_no_dca: bool = False) -> Dict[st
     # ── Сценарий E: 48-часовое управление ─────────────────────
     result_48h = _sim_48h(df, side, entry, tp_prices, sl, total_usdt)
 
+    # ── Сценарий E1: как E, но фаза 2 с 24ч ────────────────
+    result_24h = _sim_24h(df, side, entry, tp_prices, sl, total_usdt)
+
     # ── Сценарий F: Широкий стоп + веса 70/20/10 + троллинг -15% ROI ──
     result_f = _sim_f(df, side, entry, tp_prices, sl_wide, total_usdt)
 
@@ -257,6 +260,9 @@ def simulate(row: Dict, df: pd.DataFrame, force_no_dca: bool = False) -> Dict[st
 
         # Сценарий E
         "48h":            result_48h,
+
+        # Сценарий E1
+        "24h":            result_24h,
 
         # Сценарий F
         "f":              result_f,
@@ -677,6 +683,158 @@ def _sim_48h(df, side, entry, tp_prices, sl_orig, total_usdt):
     }
 
 
+def _sim_24h(df, side, entry, tp_prices, sl_orig, total_usdt):
+    """
+    Сценарий E1 — копия E но с фазой 2 начинающейся на 24ч вместо 36ч.
+
+    Фаза 1 (свечи 0–1439, до 24ч):
+      Стандартная симуляция с оригинальными TP и SL из сигнала, без троллинга.
+      TP1 → закрыть 50%, TP2 → ещё 30%, TP3 → последние 20%.
+      SL пробит → закрыть всё, исход E1_SL.
+
+    Фаза 2 (свечи ≥ 1440, после 24ч):
+      Стандартный SL убирается. Новые правила:
+      - ROI > 0: midpoint = (entry + tp1) / 2.
+        Цена ближе к TP1 → SL в безубыток, продолжать до 48ч.
+        Цена ближе к entry → закрыть немедленно (E1_close_24h_weak).
+      - ROI <= 0: динамический SL по глубине просадки, пересчёт каждую свечу.
+        Если active_sl пробит → E1_SL_dynamic.
+
+    48ч (свеча 2880): принудительное закрытие → E1_timeout_48h.
+    """
+
+    n       = len(tp_prices)
+    weights = _norm_weights(TP_WEIGHTS, n)
+
+    realized    = 0.0
+    remaining_w = 1.0
+    tps_hit     = 0
+    outcome     = "E1_timeout_48h"
+    close_price = None
+    candles     = 0
+
+    # Midpoint для Фазы 2 (ROI > 0)
+    tp1 = tp_prices[0] if tp_prices else entry
+    midpoint = (entry + tp1) / 2
+
+    # Флаг: в Фазе 2 при ROI > 0 и цене ближе к TP1 ставим SL в безубыток
+    breakeven_sl_active = False
+
+    closed = False
+
+    for _, row in df.iterrows():
+        candles += 1
+        if candles > MAX_48H_CANDLES:
+            break
+
+        high, low, close = row["high"], row["low"], float(row["close"])
+
+        # ── Последовательное снятие TP (работает в обеих фазах) ───────
+        while tps_hit < n:
+            tp = tp_prices[tps_hit]
+            if (side == "BUY" and high >= tp) or (side == "SELL" and low <= tp):
+                w = weights[tps_hit]
+                realized    += pnl_usdt(entry, tp, side, total_usdt * w)
+                remaining_w -= w
+                tps_hit     += 1
+            else:
+                break
+
+        # Все TP сработали → выход
+        if tps_hit == n and remaining_w <= 0.001:
+            outcome     = f"TP{n}"
+            close_price = tp_prices[-1]
+            closed      = True
+            break
+
+        # ── ФАЗА 1: до 24ч (свечи 0–1439) ────────────────────────────
+        if candles <= 1440:
+            # Стандартный SL из сигнала
+            if sl_orig is not None:
+                if (side == "BUY" and low <= sl_orig) or (side == "SELL" and high >= sl_orig):
+                    realized    += pnl_usdt(entry, sl_orig, side, total_usdt * remaining_w)
+                    remaining_w  = 0.0
+                    outcome      = "E1_SL"
+                    close_price  = sl_orig
+                    closed       = True
+                    break
+
+        # ── ФАЗА 2: после 24ч (свечи > 1440) ─────────────────────────
+        else:
+            current_roi = roi_pct(pnl_usdt(entry, close, side, total_usdt), total_usdt)
+
+            if current_roi > 0:
+                # Плюсовой ROI
+                closer_to_tp1 = (
+                    (close >= midpoint) if side == "BUY" else (close <= midpoint)
+                )
+                if closer_to_tp1:
+                    # Цена ближе к TP1 → SL в безубыток
+                    breakeven_sl_active = True
+                else:
+                    # Цена ближе к entry → закрыть немедленно
+                    realized    += pnl_usdt(entry, close, side, total_usdt * remaining_w)
+                    remaining_w  = 0.0
+                    outcome      = "E1_close_24h_weak"
+                    close_price  = close
+                    closed       = True
+                    break
+
+                # Проверка безубыточного SL
+                if breakeven_sl_active:
+                    if (side == "BUY" and low <= entry) or (side == "SELL" and high >= entry):
+                        realized    += pnl_usdt(entry, entry, side, total_usdt * remaining_w)
+                        remaining_w  = 0.0
+                        outcome      = "E1_SL"
+                        close_price  = entry
+                        closed       = True
+                        break
+
+            else:
+                # Минусовой ROI (ROI <= 0) → динамический SL
+                if current_roi > -20:
+                    sl_dist = (0.21 / LEVERAGE) * entry
+                elif current_roi > -30:
+                    sl_dist = (0.31 / LEVERAGE) * entry
+                elif current_roi > -40:
+                    sl_dist = (0.41 / LEVERAGE) * entry
+                else:
+                    sl_dist = None  # SL снят
+
+                if sl_dist is not None:
+                    if side == "BUY":
+                        active_sl = entry - sl_dist
+                    else:
+                        active_sl = entry + sl_dist
+
+                    if (side == "BUY" and low <= active_sl) or (side == "SELL" and high >= active_sl):
+                        realized    += pnl_usdt(entry, active_sl, side, total_usdt * remaining_w)
+                        remaining_w  = 0.0
+                        outcome      = "E1_SL_dynamic"
+                        close_price  = active_sl
+                        closed       = True
+                        break
+
+    # Принудительное закрытие по истечении 48ч
+    if remaining_w > 0.001:
+        if not df.empty:
+            last = float(df.iloc[min(candles - 1, len(df) - 1)]["close"])
+        else:
+            last = entry
+        realized   += pnl_usdt(entry, last, side, total_usdt * remaining_w)
+        close_price = last
+        outcome     = "E1_timeout_48h"
+
+    return {
+        "outcome":    outcome,
+        "tps_hit":    tps_hit,
+        "pnl":        round(realized, 4),
+        "roi":        round(roi_pct(realized, total_usdt), 2),
+        "candles":    candles,
+        "close_price": close_price,
+    }
+
+
 def _calc_direction_prob(df: pd.DataFrame, side: str, horizons: List[int]) -> Dict[str, float]:
     """
     Для каждого горизонта считает % свечей где цена пошла в нужную сторону.
@@ -718,6 +876,7 @@ def _empty_result(reason: str = "NO_DATA"):
         "base": base, "trail": base,
         "wide_sl": base,
         "48h": base,
+        "24h": base,
         "f": base,
         "direction": {f"dir_{h}m": None for h in DIRECTION_HORIZONS},
     }
@@ -833,6 +992,13 @@ def main():
             "E_roi":        sim["48h"]["roi"],
             "E_candles":    sim["48h"]["candles"],
 
+            # Сценарий E1: как E, но фаза 2 с 24ч
+            "E1_outcome":   sim["24h"]["outcome"],
+            "E1_tps_hit":   sim["24h"]["tps_hit"],
+            "E1_pnl":       sim["24h"]["pnl"],
+            "E1_roi":       sim["24h"]["roi"],
+            "E1_candles":   sim["24h"]["candles"],
+
             # Сценарий F: Широкий стоп + веса 70/20/10 + троллинг -15% ROI
             "F_outcome":    sim["f"]["outcome"],
             "F_tps_hit":    sim["f"]["tps_hit"],
@@ -882,6 +1048,12 @@ def main():
             "ND_E_pnl":        sim_nd["48h"]["pnl"],
             "ND_E_roi":        sim_nd["48h"]["roi"],
             "ND_E_candles":    sim_nd["48h"]["candles"],
+
+            "ND_E1_outcome":   sim_nd["24h"]["outcome"],
+            "ND_E1_tps_hit":   sim_nd["24h"]["tps_hit"],
+            "ND_E1_pnl":       sim_nd["24h"]["pnl"],
+            "ND_E1_roi":       sim_nd["24h"]["roi"],
+            "ND_E1_candles":   sim_nd["24h"]["candles"],
 
             "ND_F_outcome":    sim_nd["f"]["outcome"],
             "ND_F_tps_hit":    sim_nd["f"]["tps_hit"],
@@ -957,6 +1129,8 @@ def main():
         # Поражение = чистый SL (не достигнут ни один TP)
         if col_prefix in ("E", "ND_E"):
             loss_mask = outcome_col.isin(["E_SL", "E_SL_dynamic"])
+        elif col_prefix in ("E1", "ND_E1"):
+            loss_mask = outcome_col.isin(["E1_SL", "E1_SL_dynamic"])
             losses = sub[loss_mask]
             wins   = sub[~loss_mask]
         else:
@@ -974,7 +1148,7 @@ def main():
         stats = [
             ["Winrate",              f"{winrate:.1f}%"],
             ["Победных сделок",      f"{len(wins)} / {total}"],
-            ["Убыточных (SL/ликв.)" if col_prefix in ("E", "ND_E") else "Убыточных (SL)",
+            ["Убыточных (SL/ликв.)" if col_prefix in ("E", "ND_E", "E1", "ND_E1") else "Убыточных (SL)",
                                      f"{len(losses)} / {total}"],
             ["Суммарный PnL",        f"{total_pnl:+.2f} USDT"],
             ["Средний PnL",          f"{avg_pnl:+.2f} USDT"],
@@ -1005,6 +1179,7 @@ def main():
     scenario_stats("C15", "C) SL после TP1: ROI -15%")
     scenario_stats("D",  "D) Широкий стоп 50% от объёма позиции")
     scenario_stats("E",  "E) 48ч управление (троллинг + динамический SL)")
+    scenario_stats("E1", "E1) 24ч управление (как E, фаза 2 с 24ч)")
     scenario_stats("F",  "F) D+C15 (широкий стоп, 70/20/10, троллинг -15% ROI)")
 
     # ── Статистика без усреднения (ND_* колонки) ──────────────
@@ -1020,6 +1195,7 @@ def main():
     scenario_stats("ND_C15", "C) SL после TP1: ROI -15%")
     scenario_stats("ND_D",   "D) Широкий стоп 50% от объёма позиции")
     scenario_stats("ND_E",   "E) 48ч управление (троллинг + динамический SL)")
+    scenario_stats("ND_E1",  "E1) 24ч управление (как E, фаза 2 с 24ч)")
     scenario_stats("ND_F",   "F) D+C15 (широкий стоп, 70/20/10, троллинг -15% ROI)")
 
     # Зависимости
@@ -1116,6 +1292,7 @@ SCENARIOS = {
     "C15": {"label": "C15 · SL-15%",   "color": "#ef4444", "width": 1.5},
     "D":   {"label": "D · фикс.стоп",  "color": "#10b981", "width": 2.5},
     "E":   {"label": "E · 48ч",        "color": "#a855f7", "width": 2.0},
+    "E1":  {"label": "E1 · 24ч",      "color": "#06b6d4", "width": 2.0},
     "F":   {"label": "F · D+C15",     "color": "#f97316", "width": 2.0},
 }
 
@@ -1127,6 +1304,7 @@ ND_SCENARIOS = {
     "ND_C15": {"label": "C15 · SL-15%",   "color": "#ef4444", "width": 1.5},
     "ND_D":   {"label": "D · фикс.стоп",  "color": "#10b981", "width": 2.5},
     "ND_E":   {"label": "E · 48ч",        "color": "#a855f7", "width": 2.0},
+    "ND_E1":  {"label": "E1 · 24ч",      "color": "#06b6d4", "width": 2.0},
     "ND_F":   {"label": "F · D+C15",     "color": "#f97316", "width": 2.0},
 }
 
