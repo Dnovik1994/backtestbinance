@@ -303,6 +303,48 @@ def simulate(row: Dict, df: pd.DataFrame, force_no_dca: bool = False) -> Dict[st
     else:
         result_j = _sim_f(df, side, entry, tp_prices, sl_wide, total_usdt)
 
+    # ── Сценарии _T: таймаут 48ч (2880 свечей) ──────────────
+    TIMEOUT_CANDLES = 2880
+
+    result_a_t   = _sim_base(df, side, entry, tp_prices, sl, total_usdt,
+                             timeout_candles=TIMEOUT_CANDLES, timeout_outcome="A_T_timeout")
+    result_b_t   = _sim_trailing(df, side, entry, tp_prices, sl, total_usdt,
+                                 timeout_candles=TIMEOUT_CANDLES, timeout_outcome="B_T_timeout")
+    result_c15_t = _sim_trailing_custom(df, side, entry, tp_prices, sl,
+                                        entry * (1 - 0.15 / LEVERAGE) if side == "BUY" else entry * (1 + 0.15 / LEVERAGE),
+                                        total_usdt, timeout_candles=TIMEOUT_CANDLES, timeout_outcome="C15_T_timeout")
+    result_d_t   = _sim_base(df, side, entry, tp_prices, sl_wide, total_usdt,
+                             timeout_candles=TIMEOUT_CANDLES, timeout_outcome="D_T_timeout")
+    result_f_t   = _sim_f(df, side, entry, tp_prices, sl_wide, total_usdt,
+                          timeout_candles=TIMEOUT_CANDLES, timeout_outcome="F_T_timeout")
+
+    # F1_T: F + фильтр SL>5%
+    skip_result_f1_t = {"outcome": "F1_T_skip", "tps_hit": 0, "pnl": 0.0, "roi": 0.0, "candles": 0, "close_price": None}
+    result_f1_t = _sim_f(df, side, entry, tp_prices, sl_wide, total_usdt,
+                         timeout_candles=TIMEOUT_CANDLES, timeout_outcome="F1_T_timeout") if sl_dist >= 0.05 else skip_result_f1_t
+
+    # G_T: фильтр SL>5%
+    skip_result_g_t = {"outcome": "G_T_skip", "tps_hit": 0, "pnl": 0.0, "roi": 0.0, "candles": 0, "close_price": None}
+    result_g_t = _sim_base(df, side, entry, tp_prices, sl, total_usdt,
+                           timeout_candles=TIMEOUT_CANDLES, timeout_outcome="G_T_timeout") if sl_dist >= 0.05 else skip_result_g_t
+
+    # H_T: DCA>2%
+    result_h_t = _sim_base(df, side, entry, tp_prices, sl, h_usdt,
+                           timeout_candles=TIMEOUT_CANDLES, timeout_outcome="H_T_timeout")
+
+    # I_T / I1_T
+    result_i_t  = _sim_i(df, side, entry, tp_prices, sl, i_usdt, weights=[0.7, 0.2, 0.1],
+                         timeout_candles=TIMEOUT_CANDLES, timeout_outcome="I_T_timeout")
+    result_i1_t = _sim_i(df, side, entry, tp_prices, sl, i_usdt, weights=[0.8, 0.15, 0.05],
+                         timeout_candles=TIMEOUT_CANDLES, timeout_outcome="I1_T_timeout")
+
+    # J_T: комбо-фильтр
+    if j_skip:
+        result_j_t = {"outcome": "J_T_skip", "tps_hit": 0, "pnl": 0.0, "roi": 0.0, "candles": 0, "close_price": None}
+    else:
+        result_j_t = _sim_f(df, side, entry, tp_prices, sl_wide, total_usdt,
+                            timeout_candles=TIMEOUT_CANDLES, timeout_outcome="J_T_timeout")
+
     # ── Блок вероятности направления ─────────────────────────
     direction_prob = _calc_direction_prob(df, side, DIRECTION_HORIZONS)
 
@@ -350,12 +392,25 @@ def simulate(row: Dict, df: pd.DataFrame, force_no_dca: bool = False) -> Dict[st
         # Сценарий J
         "j":              result_j,
 
+        # Сценарии _T (таймаут 48ч)
+        "a_t":            result_a_t,
+        "b_t":            result_b_t,
+        "c15_t":          result_c15_t,
+        "d_t":            result_d_t,
+        "f_t":            result_f_t,
+        "f1_t":           result_f1_t,
+        "g_t":            result_g_t,
+        "h_t":            result_h_t,
+        "i_t":            result_i_t,
+        "i1_t":           result_i1_t,
+        "j_t":            result_j_t,
+
         # Вероятность направления
         "direction":      direction_prob,
     }
 
 
-def _sim_base(df, side, entry, tp_prices, sl, total_usdt):
+def _sim_base(df, side, entry, tp_prices, sl, total_usdt, timeout_candles=None, timeout_outcome=None):
     """Базовая симуляция: TP1-50%/TP2-30%/TP3-20%, SL без троллинга."""
     n = len(tp_prices)
     weights = _norm_weights(TP_WEIGHTS, n)
@@ -393,6 +448,15 @@ def _sim_base(df, side, entry, tp_prices, sl, total_usdt):
             close_price = tp_prices[-1]
             break
 
+        # Таймаут: принудительное закрытие
+        if timeout_candles and candles >= timeout_candles and remaining_w > 0.001:
+            t_close = float(row["close"])
+            realized   += pnl_usdt(entry, t_close, side, total_usdt * remaining_w)
+            remaining_w = 0.0
+            outcome     = timeout_outcome or "TIMEOUT_48h"
+            close_price = t_close
+            break
+
     if outcome == "TIMEOUT" and remaining_w > 0.001:
         last = float(df.iloc[-1]["close"])
         realized   += pnl_usdt(entry, last, side, total_usdt * remaining_w)
@@ -410,7 +474,7 @@ def _sim_base(df, side, entry, tp_prices, sl, total_usdt):
     }
 
 
-def _sim_trailing(df, side, entry, tp_prices, sl_orig, total_usdt):
+def _sim_trailing(df, side, entry, tp_prices, sl_orig, total_usdt, timeout_candles=None, timeout_outcome=None):
     """
     Троллинг стопа:
       После TP1 → SL на точку входа (б/у)
@@ -461,6 +525,15 @@ def _sim_trailing(df, side, entry, tp_prices, sl_orig, total_usdt):
             close_price = tp_prices[-1]
             break
 
+        # Таймаут: принудительное закрытие
+        if timeout_candles and candles >= timeout_candles and remaining_w > 0.001:
+            t_close = float(row["close"])
+            realized   += pnl_usdt(entry, t_close, side, total_usdt * remaining_w)
+            remaining_w = 0.0
+            outcome     = timeout_outcome or "TIMEOUT_48h"
+            close_price = t_close
+            break
+
     if outcome == "TIMEOUT" and remaining_w > 0.001:
         last = float(df.iloc[-1]["close"])
         realized   += pnl_usdt(entry, last, side, total_usdt * remaining_w)
@@ -478,7 +551,7 @@ def _sim_trailing(df, side, entry, tp_prices, sl_orig, total_usdt):
     }
 
 
-def _sim_trailing_custom(df, side, entry, tp_prices, sl_orig, sl_after_tp1, total_usdt):
+def _sim_trailing_custom(df, side, entry, tp_prices, sl_orig, sl_after_tp1, total_usdt, timeout_candles=None, timeout_outcome=None):
     """
     Троллинг с кастомным SL после TP1 (например entry -5%).
     """
@@ -524,6 +597,15 @@ def _sim_trailing_custom(df, side, entry, tp_prices, sl_orig, sl_after_tp1, tota
             close_price = tp_prices[-1]
             break
 
+        # Таймаут: принудительное закрытие
+        if timeout_candles and candles >= timeout_candles and remaining_w > 0.001:
+            t_close = float(row["close"])
+            realized   += pnl_usdt(entry, t_close, side, total_usdt * remaining_w)
+            remaining_w = 0.0
+            outcome     = timeout_outcome or "TIMEOUT_48h"
+            close_price = t_close
+            break
+
     if outcome == "TIMEOUT" and remaining_w > 0.001:
         last = float(df.iloc[-1]["close"])
         realized   += pnl_usdt(entry, last, side, total_usdt * remaining_w)
@@ -541,7 +623,7 @@ def _sim_trailing_custom(df, side, entry, tp_prices, sl_orig, sl_after_tp1, tota
     }
 
 
-def _sim_f(df, side, entry, tp_prices, sl_wide, total_usdt):
+def _sim_f(df, side, entry, tp_prices, sl_wide, total_usdt, timeout_candles=None, timeout_outcome=None):
     """
     Сценарий F — широкий стоп (D) + веса 70/20/10 + троллинг -15% ROI после TP1.
       Веса TP: 70% / 20% / 10%
@@ -594,6 +676,15 @@ def _sim_f(df, side, entry, tp_prices, sl_wide, total_usdt):
             close_price = tp_prices[-1]
             break
 
+        # Таймаут: принудительное закрытие
+        if timeout_candles and candles >= timeout_candles and remaining_w > 0.001:
+            t_close = float(row["close"])
+            realized   += pnl_usdt(entry, t_close, side, total_usdt * remaining_w)
+            remaining_w = 0.0
+            outcome     = timeout_outcome or "TIMEOUT_48h"
+            close_price = t_close
+            break
+
     if outcome == "TIMEOUT" and remaining_w > 0.001:
         last = float(df.iloc[-1]["close"])
         realized   += pnl_usdt(entry, last, side, total_usdt * remaining_w)
@@ -611,7 +702,7 @@ def _sim_f(df, side, entry, tp_prices, sl_wide, total_usdt):
     }
 
 
-def _sim_i(df, side, entry, tp_prices, sl, total_usdt, weights):
+def _sim_i(df, side, entry, tp_prices, sl, total_usdt, weights, timeout_candles=None, timeout_outcome=None):
     """
     Сценарий I / I1 — фильтр по размеру SL (<4%) + DCA как H + троллинг -15% ROI после TP1, TP1 после TP2.
       Фильтр: abs(sl - entry) / entry < 0.04 → I_skip
@@ -669,6 +760,15 @@ def _sim_i(df, side, entry, tp_prices, sl, total_usdt, weights):
         if tps_hit == n and remaining_w <= 0.001:
             outcome     = f"TP{n}"
             close_price = tp_prices[-1]
+            break
+
+        # Таймаут: принудительное закрытие
+        if timeout_candles and candles >= timeout_candles and remaining_w > 0.001:
+            t_close = float(row["close"])
+            realized   += pnl_usdt(entry, t_close, side, total_usdt * remaining_w)
+            remaining_w = 0.0
+            outcome     = timeout_outcome or "TIMEOUT_48h"
+            close_price = t_close
             break
 
     if outcome == "TIMEOUT" and remaining_w > 0.001:
@@ -1044,6 +1144,9 @@ def _empty_result(reason: str = "NO_DATA"):
         "i": base,
         "i1": base,
         "j": base,
+        "a_t": base, "b_t": base, "c15_t": base, "d_t": base,
+        "f_t": base, "f1_t": base, "g_t": base, "h_t": base,
+        "i_t": base, "i1_t": base, "j_t": base,
         "direction": {f"dir_{h}m": None for h in DIRECTION_HORIZONS},
     }
     for pct in SL_AFTER_TP1_VARIANTS:
@@ -1230,6 +1333,62 @@ def main():
                 "J_pnl":        sim["j"]["pnl"],
                 "J_roi":        sim["j"]["roi"],
 
+                # Сценарии _T (таймаут 48ч)
+                "A_T_outcome":    sim["a_t"]["outcome"],
+                "A_T_tps_hit":    sim["a_t"]["tps_hit"],
+                "A_T_pnl":        sim["a_t"]["pnl"],
+                "A_T_roi":        sim["a_t"]["roi"],
+
+                "B_T_outcome":    sim["b_t"]["outcome"],
+                "B_T_tps_hit":    sim["b_t"]["tps_hit"],
+                "B_T_pnl":        sim["b_t"]["pnl"],
+                "B_T_roi":        sim["b_t"]["roi"],
+
+                "C15_T_outcome":  sim["c15_t"]["outcome"],
+                "C15_T_tps_hit":  sim["c15_t"]["tps_hit"],
+                "C15_T_pnl":      sim["c15_t"]["pnl"],
+                "C15_T_roi":      sim["c15_t"]["roi"],
+
+                "D_T_outcome":    sim["d_t"]["outcome"],
+                "D_T_tps_hit":    sim["d_t"]["tps_hit"],
+                "D_T_pnl":        sim["d_t"]["pnl"],
+                "D_T_roi":        sim["d_t"]["roi"],
+
+                "F_T_outcome":    sim["f_t"]["outcome"],
+                "F_T_tps_hit":    sim["f_t"]["tps_hit"],
+                "F_T_pnl":        sim["f_t"]["pnl"],
+                "F_T_roi":        sim["f_t"]["roi"],
+
+                "F1_T_outcome":   sim["f1_t"]["outcome"],
+                "F1_T_tps_hit":   sim["f1_t"]["tps_hit"],
+                "F1_T_pnl":       sim["f1_t"]["pnl"],
+                "F1_T_roi":       sim["f1_t"]["roi"],
+
+                "G_T_outcome":    sim["g_t"]["outcome"],
+                "G_T_tps_hit":    sim["g_t"]["tps_hit"],
+                "G_T_pnl":        sim["g_t"]["pnl"],
+                "G_T_roi":        sim["g_t"]["roi"],
+
+                "H_T_outcome":    sim["h_t"]["outcome"],
+                "H_T_tps_hit":    sim["h_t"]["tps_hit"],
+                "H_T_pnl":        sim["h_t"]["pnl"],
+                "H_T_roi":        sim["h_t"]["roi"],
+
+                "I_T_outcome":    sim["i_t"]["outcome"],
+                "I_T_tps_hit":    sim["i_t"]["tps_hit"],
+                "I_T_pnl":        sim["i_t"]["pnl"],
+                "I_T_roi":        sim["i_t"]["roi"],
+
+                "I1_T_outcome":   sim["i1_t"]["outcome"],
+                "I1_T_tps_hit":   sim["i1_t"]["tps_hit"],
+                "I1_T_pnl":       sim["i1_t"]["pnl"],
+                "I1_T_roi":       sim["i1_t"]["roi"],
+
+                "J_T_outcome":    sim["j_t"]["outcome"],
+                "J_T_tps_hit":    sim["j_t"]["tps_hit"],
+                "J_T_pnl":        sim["j_t"]["pnl"],
+                "J_T_roi":        sim["j_t"]["roi"],
+
                 # Вероятность направления
                 "dir_5m":       sim["direction"].get("dir_5m"),
                 "dir_15m":      sim["direction"].get("dir_15m"),
@@ -1313,6 +1472,62 @@ def main():
                 "ND_J_tps_hit":    sim_nd["j"]["tps_hit"],
                 "ND_J_pnl":        sim_nd["j"]["pnl"],
                 "ND_J_roi":        sim_nd["j"]["roi"],
+
+                # ND _T сценарии (без усреднения + таймаут 48ч)
+                "ND_A_T_outcome":    sim_nd["a_t"]["outcome"],
+                "ND_A_T_tps_hit":    sim_nd["a_t"]["tps_hit"],
+                "ND_A_T_pnl":        sim_nd["a_t"]["pnl"],
+                "ND_A_T_roi":        sim_nd["a_t"]["roi"],
+
+                "ND_B_T_outcome":    sim_nd["b_t"]["outcome"],
+                "ND_B_T_tps_hit":    sim_nd["b_t"]["tps_hit"],
+                "ND_B_T_pnl":        sim_nd["b_t"]["pnl"],
+                "ND_B_T_roi":        sim_nd["b_t"]["roi"],
+
+                "ND_C15_T_outcome":  sim_nd["c15_t"]["outcome"],
+                "ND_C15_T_tps_hit":  sim_nd["c15_t"]["tps_hit"],
+                "ND_C15_T_pnl":      sim_nd["c15_t"]["pnl"],
+                "ND_C15_T_roi":      sim_nd["c15_t"]["roi"],
+
+                "ND_D_T_outcome":    sim_nd["d_t"]["outcome"],
+                "ND_D_T_tps_hit":    sim_nd["d_t"]["tps_hit"],
+                "ND_D_T_pnl":        sim_nd["d_t"]["pnl"],
+                "ND_D_T_roi":        sim_nd["d_t"]["roi"],
+
+                "ND_F_T_outcome":    sim_nd["f_t"]["outcome"],
+                "ND_F_T_tps_hit":    sim_nd["f_t"]["tps_hit"],
+                "ND_F_T_pnl":        sim_nd["f_t"]["pnl"],
+                "ND_F_T_roi":        sim_nd["f_t"]["roi"],
+
+                "ND_F1_T_outcome":   sim_nd["f1_t"]["outcome"],
+                "ND_F1_T_tps_hit":   sim_nd["f1_t"]["tps_hit"],
+                "ND_F1_T_pnl":       sim_nd["f1_t"]["pnl"],
+                "ND_F1_T_roi":       sim_nd["f1_t"]["roi"],
+
+                "ND_G_T_outcome":    sim_nd["g_t"]["outcome"],
+                "ND_G_T_tps_hit":    sim_nd["g_t"]["tps_hit"],
+                "ND_G_T_pnl":        sim_nd["g_t"]["pnl"],
+                "ND_G_T_roi":        sim_nd["g_t"]["roi"],
+
+                "ND_H_T_outcome":    sim_nd["h_t"]["outcome"],
+                "ND_H_T_tps_hit":    sim_nd["h_t"]["tps_hit"],
+                "ND_H_T_pnl":        sim_nd["h_t"]["pnl"],
+                "ND_H_T_roi":        sim_nd["h_t"]["roi"],
+
+                "ND_I_T_outcome":    sim_nd["i_t"]["outcome"],
+                "ND_I_T_tps_hit":    sim_nd["i_t"]["tps_hit"],
+                "ND_I_T_pnl":        sim_nd["i_t"]["pnl"],
+                "ND_I_T_roi":        sim_nd["i_t"]["roi"],
+
+                "ND_I1_T_outcome":   sim_nd["i1_t"]["outcome"],
+                "ND_I1_T_tps_hit":   sim_nd["i1_t"]["tps_hit"],
+                "ND_I1_T_pnl":       sim_nd["i1_t"]["pnl"],
+                "ND_I1_T_roi":       sim_nd["i1_t"]["roi"],
+
+                "ND_J_T_outcome":    sim_nd["j_t"]["outcome"],
+                "ND_J_T_tps_hit":    sim_nd["j_t"]["tps_hit"],
+                "ND_J_T_pnl":        sim_nd["j_t"]["pnl"],
+                "ND_J_T_roi":        sim_nd["j_t"]["roi"],
             }
             results.append(row)
             time.sleep(0.25)
@@ -1395,36 +1610,39 @@ def main():
             loss_mask = outcome_col.isin(["E1_SL", "E1_SL_dynamic"])
             losses = sub[loss_mask]
             wins   = sub[~loss_mask]
-        elif col_prefix in ("G", "ND_G"):
-            # Исключаем пропущенные (G_skip) из подсчёта
-            sub = sub[outcome_col != "G_skip"]
+        elif col_prefix in ("G", "ND_G", "G_T", "ND_G_T"):
+            # Исключаем пропущенные (G_skip / G_T_skip) из подсчёта
+            skip_vals = ["G_skip", "G_T_skip"]
+            sub = sub[~outcome_col.isin(skip_vals)]
             if sub.empty:
                 return
             total = len(sub)
             outcome_col = sub[f"{col_prefix}_outcome"]
             losses = sub[outcome_col == "SL"]
             wins   = sub[outcome_col != "SL"]
-        elif col_prefix in ("F1", "ND_F1"):
-            # Исключаем пропущенные (F1_skip) из подсчёта
-            sub = sub[outcome_col != "F1_skip"]
+        elif col_prefix in ("F1", "ND_F1", "F1_T", "ND_F1_T"):
+            # Исключаем пропущенные (F1_skip / F1_T_skip) из подсчёта
+            skip_vals = ["F1_skip", "F1_T_skip"]
+            sub = sub[~outcome_col.isin(skip_vals)]
             if sub.empty:
                 return
             total = len(sub)
             outcome_col = sub[f"{col_prefix}_outcome"]
             losses = sub[outcome_col == "SL"]
             wins   = sub[outcome_col != "SL"]
-        elif col_prefix in ("I", "ND_I", "I1", "ND_I1"):
+        elif col_prefix in ("I", "ND_I", "I1", "ND_I1", "I_T", "ND_I_T", "I1_T", "ND_I1_T"):
             # Исключаем пропущенные (I_skip) из подсчёта
-            sub = sub[outcome_col != "I_skip"]
+            sub = sub[~outcome_col.isin(["I_skip"])]
             if sub.empty:
                 return
             total = len(sub)
             outcome_col = sub[f"{col_prefix}_outcome"]
             losses = sub[outcome_col == "SL"]
             wins   = sub[outcome_col != "SL"]
-        elif col_prefix in ("J", "ND_J"):
-            # Исключаем пропущенные (J_skip) из подсчёта
-            sub = sub[outcome_col != "J_skip"]
+        elif col_prefix in ("J", "ND_J", "J_T", "ND_J_T"):
+            # Исключаем пропущенные (J_skip / J_T_skip) из подсчёта
+            skip_vals = ["J_skip", "J_T_skip"]
+            sub = sub[~outcome_col.isin(skip_vals)]
             if sub.empty:
                 return
             total = len(sub)
@@ -1486,6 +1704,24 @@ def main():
     scenario_stats("I1", "I1) фильтр+H+C15 (80/15/5)")
     scenario_stats("J",  "J) комбо-фильтр (будни, 10-14ч, RR 6-7)")
 
+    # ── Сценарии _T (таймаут 48ч) ──────────────────────────────
+    report.append("═" * 60)
+    report.append("     СЦЕНАРИИ С ТАЙМАУТОМ 48ч (_T)")
+    report.append("═" * 60)
+    report.append("")
+
+    scenario_stats("A_T",    "A_T) Базовый +48ч таймаут")
+    scenario_stats("B_T",    "B_T) Троллинг +48ч таймаут")
+    scenario_stats("C15_T",  "C15_T) SL-15% +48ч таймаут")
+    scenario_stats("D_T",    "D_T) Широкий стоп +48ч таймаут")
+    scenario_stats("F_T",    "F_T) D+C15 +48ч таймаут")
+    scenario_stats("F1_T",   "F1_T) F+фильтр SL>5% +48ч таймаут")
+    scenario_stats("G_T",    "G_T) Фильтр SL>5% +48ч таймаут")
+    scenario_stats("H_T",    "H_T) DCA>2% +48ч таймаут")
+    scenario_stats("I_T",    "I_T) фильтр+H+C15 (70/20/10) +48ч таймаут")
+    scenario_stats("I1_T",   "I1_T) фильтр+H+C15 (80/15/5) +48ч таймаут")
+    scenario_stats("J_T",    "J_T) комбо-фильтр +48ч таймаут")
+
     # ── Статистика без усреднения (ND_* колонки) ──────────────
     report.append("═" * 60)
     report.append(f"     СТАТИСТИКА БЕЗ УСРЕДНЕНИЯ (все {len(df_clean)} сделки, позиция всегда {POSITION_USDT:.0f} USDT)")
@@ -1507,6 +1743,24 @@ def main():
     scenario_stats("ND_I",   "I) фильтр+H+C15 (70/20/10)")
     scenario_stats("ND_I1",  "I1) фильтр+H+C15 (80/15/5)")
     scenario_stats("ND_J",   "J) комбо-фильтр (будни, 10-14ч, RR 6-7)")
+
+    # ── ND _T сценарии (без усреднения + таймаут 48ч) ──────────
+    report.append("═" * 60)
+    report.append("     БЕЗ УСРЕДНЕНИЯ + ТАЙМАУТ 48ч (ND_*_T)")
+    report.append("═" * 60)
+    report.append("")
+
+    scenario_stats("ND_A_T",    "A_T) Базовый +48ч таймаут")
+    scenario_stats("ND_B_T",    "B_T) Троллинг +48ч таймаут")
+    scenario_stats("ND_C15_T",  "C15_T) SL-15% +48ч таймаут")
+    scenario_stats("ND_D_T",    "D_T) Широкий стоп +48ч таймаут")
+    scenario_stats("ND_F_T",    "F_T) D+C15 +48ч таймаут")
+    scenario_stats("ND_F1_T",   "F1_T) F+фильтр SL>5% +48ч таймаут")
+    scenario_stats("ND_G_T",    "G_T) Фильтр SL>5% +48ч таймаут")
+    scenario_stats("ND_H_T",    "H_T) DCA>2% +48ч таймаут")
+    scenario_stats("ND_I_T",    "I_T) фильтр+H+C15 (70/20/10) +48ч таймаут")
+    scenario_stats("ND_I1_T",   "I1_T) фильтр+H+C15 (80/15/5) +48ч таймаут")
+    scenario_stats("ND_J_T",    "J_T) комбо-фильтр +48ч таймаут")
 
     # Зависимости
     report.append("── Зависимость: размер стопа vs результат ─────────────")
@@ -1610,6 +1864,18 @@ SCENARIOS = {
     "I":   {"label": "I · фильтр+H+C15",          "color": "#0ea5e9", "width": 2.0},
     "I1":  {"label": "I1 · фильтр+H+C15 80/15/5", "color": "#8b5cf6", "width": 2.0},
     "J":   {"label": "J · комбо-фильтр",          "color": "#22c55e", "width": 2.5},
+    # _T сценарии (таймаут 48ч) — те же цвета, width=1.5
+    "A_T":    {"label": "A +48ч",              "color": "#3b82f6", "width": 1.5},
+    "B_T":    {"label": "B +48ч",              "color": "#f59e0b", "width": 1.5},
+    "C15_T":  {"label": "C15 +48ч",            "color": "#ef4444", "width": 1.5},
+    "D_T":    {"label": "D +48ч",              "color": "#10b981", "width": 1.5},
+    "F_T":    {"label": "F +48ч",              "color": "#f97316", "width": 1.5},
+    "F1_T":   {"label": "F1 +48ч",             "color": "#f43f5e", "width": 1.5},
+    "G_T":    {"label": "G +48ч",              "color": "#eab308", "width": 1.5},
+    "H_T":    {"label": "H +48ч",              "color": "#84cc16", "width": 1.5},
+    "I_T":    {"label": "I +48ч",              "color": "#0ea5e9", "width": 1.5},
+    "I1_T":   {"label": "I1 +48ч",             "color": "#8b5cf6", "width": 1.5},
+    "J_T":    {"label": "J +48ч",              "color": "#22c55e", "width": 1.5},
 }
 
 ND_SCENARIOS = {
@@ -1628,6 +1894,18 @@ ND_SCENARIOS = {
     "ND_I":   {"label": "I · фильтр+H+C15",          "color": "#0ea5e9", "width": 2.0},
     "ND_I1":  {"label": "I1 · фильтр+H+C15 80/15/5", "color": "#8b5cf6", "width": 2.0},
     "ND_J":   {"label": "J · комбо-фильтр",          "color": "#22c55e", "width": 2.5},
+    # ND _T сценарии (таймаут 48ч) — те же цвета, width=1.5
+    "ND_A_T":    {"label": "A +48ч",              "color": "#3b82f6", "width": 1.5},
+    "ND_B_T":    {"label": "B +48ч",              "color": "#f59e0b", "width": 1.5},
+    "ND_C15_T":  {"label": "C15 +48ч",            "color": "#ef4444", "width": 1.5},
+    "ND_D_T":    {"label": "D +48ч",              "color": "#10b981", "width": 1.5},
+    "ND_F_T":    {"label": "F +48ч",              "color": "#f97316", "width": 1.5},
+    "ND_F1_T":   {"label": "F1 +48ч",             "color": "#f43f5e", "width": 1.5},
+    "ND_G_T":    {"label": "G +48ч",              "color": "#eab308", "width": 1.5},
+    "ND_H_T":    {"label": "H +48ч",              "color": "#84cc16", "width": 1.5},
+    "ND_I_T":    {"label": "I +48ч",              "color": "#0ea5e9", "width": 1.5},
+    "ND_I1_T":   {"label": "I1 +48ч",             "color": "#8b5cf6", "width": 1.5},
+    "ND_J_T":    {"label": "J +48ч",              "color": "#22c55e", "width": 1.5},
 }
 
 def _pnl_col(scen):
