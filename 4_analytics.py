@@ -120,11 +120,12 @@ def get_klines_batch(symbol: str, start_ts_ms: int, limit: int = BATCH_CANDLES) 
     return df
 
 
-def get_klines_until_close(symbol: str, start_ts_ms: int,
-                            tp_prices: list, sl: float, side: str) -> pd.DataFrame:
+def get_klines_until_close(symbol: str, start_ts_ms: int) -> pd.DataFrame:
     """
-    Подгружает свечи батчами пока не сработает TP или SL.
-    Максимум MAX_DAYS дней — защита от бесконечного цикла.
+    Подгружает свечи батчами на весь горизонт MAX_DAYS.
+    Всегда загружает полный набор свечей (до 10080) независимо от исхода сделки,
+    чтобы кэш всегда содержал полные данные.
+    Симуляция сама останавливается при нахождении SL/TP.
     """
     max_ts_ms = start_ts_ms + MAX_DAYS * 24 * 60 * 60 * 1000
     all_frames = []
@@ -138,25 +139,6 @@ def get_klines_until_close(symbol: str, start_ts_ms: int,
 
         all_frames.append(df)
         total_candles += len(df)
-
-        # Проверяем — закрылась ли сделка в этом батче
-        closed = False
-        for _, row in df.iterrows():
-            high, low = row["high"], row["low"]
-            # Проверяем все TP
-            for tp in tp_prices:
-                if (side == "BUY" and high >= tp) or (side == "SELL" and low <= tp):
-                    closed = True
-                    break
-            # Проверяем SL
-            if (side == "BUY" and low <= sl) or (side == "SELL" and high >= sl):
-                closed = True
-                break
-            if closed:
-                break
-
-        if closed:
-            break
 
         # Если батч неполный — данных больше нет (будущее)
         if len(df) < BATCH_CANDLES:
@@ -709,20 +691,8 @@ def main():
 
         print(f"[{i+1}/{len(valid)}] {sym} {side} @ {entry} ({ts_str})")
 
-        # Загружаем свечи — батчами пока не закроется сделка
-        try:
-            tp_prices_for_fetch = [float(trade["tp1"]), float(trade["tp2"]) if trade["tp2"] else None,
-                                    float(trade["tp3"]) if trade["tp3"] else None]
-            tp_prices_for_fetch = [t for t in tp_prices_for_fetch if t]
-            sl_for_fetch = float(trade["sl"]) if trade["sl"] else None
-        except Exception:
-            tp_prices_for_fetch = []
-            sl_for_fetch = None
-
-        if tp_prices_for_fetch and sl_for_fetch:
-            df = get_klines_until_close(sym, ts_ms, tp_prices_for_fetch, sl_for_fetch, side)
-        else:
-            df = get_klines_batch(sym, ts_ms)
+        # Загружаем свечи — полный горизонт MAX_DAYS для корректного кэширования
+        df = get_klines_until_close(sym, ts_ms)
         sim = simulate(trade, df)
         sim_nd = simulate(trade, df, force_no_dca=True)
 
