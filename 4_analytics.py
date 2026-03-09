@@ -467,7 +467,6 @@ def _sim_48h(df, side, entry, tp_prices, sl_orig, total_usdt):
         Если active_sl пробит → E_SL_dynamic.
 
     48ч (свеча 2880): принудительное закрытие → E_timeout_48h.
-    Ликвидация (только Фаза 2): цена пробивает entry ± total_usdt/qty → E_liquidation.
     """
 
     n       = len(tp_prices)
@@ -479,14 +478,6 @@ def _sim_48h(df, side, entry, tp_prices, sl_orig, total_usdt):
     outcome     = "E_timeout_48h"
     close_price = None
     candles     = 0
-
-    # Порог ликвидации
-    qty = (total_usdt * LEVERAGE) / entry
-    liq_dist = total_usdt / qty
-    if side == "BUY":
-        liq_price = entry - liq_dist
-    else:
-        liq_price = entry + liq_dist
 
     # Midpoint для Фазы 2 (ROI > 0)
     tp1 = tp_prices[0] if tp_prices else entry
@@ -536,15 +527,6 @@ def _sim_48h(df, side, entry, tp_prices, sl_orig, total_usdt):
 
         # ── ФАЗА 2: после 36ч (свечи > 2160) ─────────────────────────
         else:
-            # Ликвидация — немедленный выход (только Фаза 2, SL снят)
-            if (side == "BUY" and low <= liq_price) or (side == "SELL" and high >= liq_price):
-                realized    = -total_usdt
-                remaining_w = 0.0
-                outcome     = "E_liquidation"
-                close_price = liq_price
-                closed      = True
-                break
-
             current_roi = roi_pct(pnl_usdt(entry, close, side, total_usdt), total_usdt)
 
             if current_roi > 0:
@@ -876,7 +858,7 @@ def main():
         # Winrate: победа = достигнут хотя бы один TP (включая SL_after_TP*)
         # Поражение = чистый SL (не достигнут ни один TP)
         if col_prefix in ("E", "ND_E"):
-            loss_mask = outcome_col.isin(["E_SL", "E_SL_dynamic", "E_liquidation"])
+            loss_mask = outcome_col.isin(["E_SL", "E_SL_dynamic"])
             losses = sub[loss_mask]
             wins   = sub[~loss_mask]
         else:
