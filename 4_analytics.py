@@ -277,6 +277,11 @@ def simulate(row: Dict, df: pd.DataFrame, force_no_dca: bool = False) -> Dict[st
     h_usdt = total_usdt if h_use_dca else POSITION_USDT
     result_h = _sim_base(df, side, entry, tp_prices, sl, h_usdt)
 
+    # ── Сценарий I / I1: фильтр + H + C15 ────────────────────
+    i_usdt = total_usdt if h_use_dca else POSITION_USDT
+    result_i  = _sim_i(df, side, entry, tp_prices, sl, i_usdt, weights=[0.7, 0.2, 0.1])
+    result_i1 = _sim_i(df, side, entry, tp_prices, sl, i_usdt, weights=[0.8, 0.15, 0.05])
+
     # ── Блок вероятности направления ─────────────────────────
     direction_prob = _calc_direction_prob(df, side, DIRECTION_HORIZONS)
 
@@ -314,6 +319,12 @@ def simulate(row: Dict, df: pd.DataFrame, force_no_dca: bool = False) -> Dict[st
         "f1":             result_f1,
         # Сценарий H
         "h":              result_h,
+
+        # Сценарий I
+        "i":              result_i,
+
+        # Сценарий I1
+        "i1":             result_i1,
 
         # Вероятность направления
         "direction":      direction_prob,
@@ -538,6 +549,83 @@ def _sim_f(df, side, entry, tp_prices, sl_wide, total_usdt):
                 w = weights[tps_hit]
                 realized    += pnl_usdt(entry, tp, side, total_usdt * w)
                 remaining_w -= w
+                tps_hit     += 1
+
+                if tps_hit == 1:
+                    current_sl = sl_after_tp1
+                elif tps_hit == 2 and len(tp_prices) >= 1:
+                    current_sl = tp_prices[0]
+            else:
+                break
+
+        if (side == "BUY" and low <= current_sl) or (side == "SELL" and high >= current_sl):
+            realized    += pnl_usdt(entry, current_sl, side, total_usdt * remaining_w)
+            remaining_w  = 0.0
+            outcome      = f"SL_after_TP{tps_hit}" if tps_hit > 0 else "SL"
+            close_price  = current_sl
+            break
+
+        if tps_hit == n and remaining_w <= 0.001:
+            outcome     = f"TP{n}"
+            close_price = tp_prices[-1]
+            break
+
+    if outcome == "TIMEOUT" and remaining_w > 0.001:
+        last = float(df.iloc[-1]["close"])
+        realized   += pnl_usdt(entry, last, side, total_usdt * remaining_w)
+        close_price = last
+        if tps_hit > 0:
+            outcome = f"TP{tps_hit}_TIMEOUT"
+
+    return {
+        "outcome":    outcome,
+        "tps_hit":    tps_hit,
+        "pnl":        round(realized, 4),
+        "roi":        round(roi_pct(realized, total_usdt), 2),
+        "candles":    candles,
+        "close_price": close_price,
+    }
+
+
+def _sim_i(df, side, entry, tp_prices, sl, total_usdt, weights):
+    """
+    Сценарий I / I1 — фильтр по размеру SL (<4%) + DCA как H + троллинг -15% ROI после TP1, TP1 после TP2.
+      Фильтр: abs(sl - entry) / entry < 0.04 → I_skip
+      Веса TP: передаются параметром weights
+      До TP1: оригинальный SL из сигнала
+      После TP1 → SL на -15% ROI от entry
+      После TP2 → SL на TP1
+    """
+    # Фильтр: SL слишком маленький
+    if abs(sl - entry) / entry < 0.04:
+        return {
+            "outcome": "I_skip", "tps_hit": 0, "pnl": 0.0, "roi": 0.0,
+            "candles": 0, "close_price": None,
+        }
+
+    n = len(tp_prices)
+    w = _norm_weights(weights, n)
+
+    realized    = 0.0
+    remaining_w = 1.0
+    tps_hit     = 0
+    current_sl  = sl
+    outcome     = "TIMEOUT"
+    close_price = None
+    candles     = 0
+
+    # SL после TP1: -15% ROI от entry
+    sl_after_tp1 = entry * (1 - 0.15 / LEVERAGE) if side == "BUY" else entry * (1 + 0.15 / LEVERAGE)
+
+    for _, row in df.iterrows():
+        candles += 1
+        high, low = row["high"], row["low"]
+
+        while tps_hit < n:
+            tp = tp_prices[tps_hit]
+            if (side == "BUY" and high >= tp) or (side == "SELL" and low <= tp):
+                realized    += pnl_usdt(entry, tp, side, total_usdt * w[tps_hit])
+                remaining_w -= w[tps_hit]
                 tps_hit     += 1
 
                 if tps_hit == 1:
@@ -929,6 +1017,8 @@ def _empty_result(reason: str = "NO_DATA"):
         "g": base,
         "f1": base,
         "h": base,
+        "i": base,
+        "i1": base,
         "direction": {f"dir_{h}m": None for h in DIRECTION_HORIZONS},
     }
     for pct in SL_AFTER_TP1_VARIANTS:
@@ -1097,6 +1187,18 @@ def main():
                 "H_pnl":        sim["h"]["pnl"],
                 "H_roi":        sim["h"]["roi"],
 
+                # Сценарий I: фильтр+H+C15 (70/20/10)
+                "I_outcome":    sim["i"]["outcome"],
+                "I_tps_hit":    sim["i"]["tps_hit"],
+                "I_pnl":        sim["i"]["pnl"],
+                "I_roi":        sim["i"]["roi"],
+
+                # Сценарий I1: фильтр+H+C15 (80/15/5)
+                "I1_outcome":   sim["i1"]["outcome"],
+                "I1_tps_hit":   sim["i1"]["tps_hit"],
+                "I1_pnl":       sim["i1"]["pnl"],
+                "I1_roi":       sim["i1"]["roi"],
+
                 # Вероятность направления
                 "dir_5m":       sim["direction"].get("dir_5m"),
                 "dir_15m":      sim["direction"].get("dir_15m"),
@@ -1165,6 +1267,16 @@ def main():
                 "ND_H_tps_hit":    sim_nd["h"]["tps_hit"],
                 "ND_H_pnl":        sim_nd["h"]["pnl"],
                 "ND_H_roi":        sim_nd["h"]["roi"],
+
+                "ND_I_outcome":    sim_nd["i"]["outcome"],
+                "ND_I_tps_hit":    sim_nd["i"]["tps_hit"],
+                "ND_I_pnl":        sim_nd["i"]["pnl"],
+                "ND_I_roi":        sim_nd["i"]["roi"],
+
+                "ND_I1_outcome":   sim_nd["i1"]["outcome"],
+                "ND_I1_tps_hit":   sim_nd["i1"]["tps_hit"],
+                "ND_I1_pnl":       sim_nd["i1"]["pnl"],
+                "ND_I1_roi":       sim_nd["i1"]["roi"],
             }
             results.append(row)
             time.sleep(0.25)
@@ -1265,6 +1377,15 @@ def main():
             outcome_col = sub[f"{col_prefix}_outcome"]
             losses = sub[outcome_col == "SL"]
             wins   = sub[outcome_col != "SL"]
+        elif col_prefix in ("I", "ND_I", "I1", "ND_I1"):
+            # Исключаем пропущенные (I_skip) из подсчёта
+            sub = sub[outcome_col != "I_skip"]
+            if sub.empty:
+                return
+            total = len(sub)
+            outcome_col = sub[f"{col_prefix}_outcome"]
+            losses = sub[outcome_col == "SL"]
+            wins   = sub[outcome_col != "SL"]
         else:
             losses = sub[outcome_col == "SL"]
             wins   = sub[outcome_col != "SL"]
@@ -1316,6 +1437,8 @@ def main():
     scenario_stats("G",  "G) Фильтр SL>5% (базовый)")
     scenario_stats("F1", "F1) F + фильтр SL>5%")
     scenario_stats("H",  "H) DCA только если цена ушла >2% против позиции")
+    scenario_stats("I",  "I) фильтр+H+C15 (70/20/10)")
+    scenario_stats("I1", "I1) фильтр+H+C15 (80/15/5)")
 
     # ── Статистика без усреднения (ND_* колонки) ──────────────
     report.append("═" * 60)
@@ -1335,6 +1458,8 @@ def main():
     scenario_stats("ND_G",   "G) Фильтр SL>5% (базовый)")
     scenario_stats("ND_F1",  "F1) F + фильтр SL>5%")
     scenario_stats("ND_H",   "H) DCA только если цена ушла >2% против позиции")
+    scenario_stats("ND_I",   "I) фильтр+H+C15 (70/20/10)")
+    scenario_stats("ND_I1",  "I1) фильтр+H+C15 (80/15/5)")
 
     # Зависимости
     report.append("── Зависимость: размер стопа vs результат ─────────────")
@@ -1435,6 +1560,8 @@ SCENARIOS = {
     "G":   {"label": "G · фильтр SL>5%", "color": "#eab308", "width": 2.0},
     "F1":  {"label": "F1 · F+фильтр",   "color": "#f43f5e", "width": 2.0},
     "H":   {"label": "H · DCA>2%",    "color": "#84cc16", "width": 2.0},
+    "I":   {"label": "I · фильтр+H+C15",          "color": "#0ea5e9", "width": 2.0},
+    "I1":  {"label": "I1 · фильтр+H+C15 80/15/5", "color": "#8b5cf6", "width": 2.0},
 }
 
 ND_SCENARIOS = {
@@ -1450,6 +1577,8 @@ ND_SCENARIOS = {
     "ND_G":   {"label": "G · фильтр SL>5%", "color": "#eab308", "width": 2.0},
     "ND_F1":  {"label": "F1 · F+фильтр",   "color": "#f43f5e", "width": 2.0},
     "ND_H":   {"label": "H · DCA>2%",    "color": "#84cc16", "width": 2.0},
+    "ND_I":   {"label": "I · фильтр+H+C15",          "color": "#0ea5e9", "width": 2.0},
+    "ND_I1":  {"label": "I1 · фильтр+H+C15 80/15/5", "color": "#8b5cf6", "width": 2.0},
 }
 
 def _pnl_col(scen):
