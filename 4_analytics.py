@@ -282,6 +282,27 @@ def simulate(row: Dict, df: pd.DataFrame, force_no_dca: bool = False) -> Dict[st
     result_i  = _sim_i(df, side, entry, tp_prices, sl, i_usdt, weights=[0.7, 0.2, 0.1])
     result_i1 = _sim_i(df, side, entry, tp_prices, sl, i_usdt, weights=[0.8, 0.15, 0.05])
 
+    # ── Сценарий J: комбо-фильтр лучших условий входа ──────
+    try:
+        ts = datetime.strptime(row.get("signal_ts", ""), "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        ts = None
+
+    j_skip = True
+    if ts is not None and tp_prices and sl is not None:
+        is_weekday = ts.weekday() < 5
+        is_good_hour = ts.hour in (10, 11, 12, 13, 14)
+        sl_dist_j = abs(sl - entry) / entry
+        tp1_dist_j = abs(tp_prices[0] - entry) / entry
+        rr_ratio = sl_dist_j / tp1_dist_j if tp1_dist_j > 0 else 0.0
+        if is_weekday and is_good_hour and 6.0 <= rr_ratio <= 7.0:
+            j_skip = False
+
+    if j_skip:
+        result_j = {"outcome": "J_skip", "tps_hit": 0, "pnl": 0.0, "roi": 0.0, "candles": 0, "close_price": None}
+    else:
+        result_j = _sim_f(df, side, entry, tp_prices, sl_wide, total_usdt)
+
     # ── Блок вероятности направления ─────────────────────────
     direction_prob = _calc_direction_prob(df, side, DIRECTION_HORIZONS)
 
@@ -325,6 +346,9 @@ def simulate(row: Dict, df: pd.DataFrame, force_no_dca: bool = False) -> Dict[st
 
         # Сценарий I1
         "i1":             result_i1,
+
+        # Сценарий J
+        "j":              result_j,
 
         # Вероятность направления
         "direction":      direction_prob,
@@ -1019,6 +1043,7 @@ def _empty_result(reason: str = "NO_DATA"):
         "h": base,
         "i": base,
         "i1": base,
+        "j": base,
         "direction": {f"dir_{h}m": None for h in DIRECTION_HORIZONS},
     }
     for pct in SL_AFTER_TP1_VARIANTS:
@@ -1199,6 +1224,12 @@ def main():
                 "I1_pnl":       sim["i1"]["pnl"],
                 "I1_roi":       sim["i1"]["roi"],
 
+                # Сценарий J: комбо-фильтр
+                "J_outcome":    sim["j"]["outcome"],
+                "J_tps_hit":    sim["j"]["tps_hit"],
+                "J_pnl":        sim["j"]["pnl"],
+                "J_roi":        sim["j"]["roi"],
+
                 # Вероятность направления
                 "dir_5m":       sim["direction"].get("dir_5m"),
                 "dir_15m":      sim["direction"].get("dir_15m"),
@@ -1277,6 +1308,11 @@ def main():
                 "ND_I1_tps_hit":   sim_nd["i1"]["tps_hit"],
                 "ND_I1_pnl":       sim_nd["i1"]["pnl"],
                 "ND_I1_roi":       sim_nd["i1"]["roi"],
+
+                "ND_J_outcome":    sim_nd["j"]["outcome"],
+                "ND_J_tps_hit":    sim_nd["j"]["tps_hit"],
+                "ND_J_pnl":        sim_nd["j"]["pnl"],
+                "ND_J_roi":        sim_nd["j"]["roi"],
             }
             results.append(row)
             time.sleep(0.25)
@@ -1386,6 +1422,15 @@ def main():
             outcome_col = sub[f"{col_prefix}_outcome"]
             losses = sub[outcome_col == "SL"]
             wins   = sub[outcome_col != "SL"]
+        elif col_prefix in ("J", "ND_J"):
+            # Исключаем пропущенные (J_skip) из подсчёта
+            sub = sub[outcome_col != "J_skip"]
+            if sub.empty:
+                return
+            total = len(sub)
+            outcome_col = sub[f"{col_prefix}_outcome"]
+            losses = sub[outcome_col == "SL"]
+            wins   = sub[outcome_col != "SL"]
         else:
             losses = sub[outcome_col == "SL"]
             wins   = sub[outcome_col != "SL"]
@@ -1439,6 +1484,7 @@ def main():
     scenario_stats("H",  "H) DCA только если цена ушла >2% против позиции")
     scenario_stats("I",  "I) фильтр+H+C15 (70/20/10)")
     scenario_stats("I1", "I1) фильтр+H+C15 (80/15/5)")
+    scenario_stats("J",  "J) комбо-фильтр (будни, 10-14ч, RR 6-7)")
 
     # ── Статистика без усреднения (ND_* колонки) ──────────────
     report.append("═" * 60)
@@ -1460,6 +1506,7 @@ def main():
     scenario_stats("ND_H",   "H) DCA только если цена ушла >2% против позиции")
     scenario_stats("ND_I",   "I) фильтр+H+C15 (70/20/10)")
     scenario_stats("ND_I1",  "I1) фильтр+H+C15 (80/15/5)")
+    scenario_stats("ND_J",   "J) комбо-фильтр (будни, 10-14ч, RR 6-7)")
 
     # Зависимости
     report.append("── Зависимость: размер стопа vs результат ─────────────")
@@ -1562,6 +1609,7 @@ SCENARIOS = {
     "H":   {"label": "H · DCA>2%",    "color": "#84cc16", "width": 2.0},
     "I":   {"label": "I · фильтр+H+C15",          "color": "#0ea5e9", "width": 2.0},
     "I1":  {"label": "I1 · фильтр+H+C15 80/15/5", "color": "#8b5cf6", "width": 2.0},
+    "J":   {"label": "J · комбо-фильтр",          "color": "#22c55e", "width": 2.5},
 }
 
 ND_SCENARIOS = {
@@ -1579,6 +1627,7 @@ ND_SCENARIOS = {
     "ND_H":   {"label": "H · DCA>2%",    "color": "#84cc16", "width": 2.0},
     "ND_I":   {"label": "I · фильтр+H+C15",          "color": "#0ea5e9", "width": 2.0},
     "ND_I1":  {"label": "I1 · фильтр+H+C15 80/15/5", "color": "#8b5cf6", "width": 2.0},
+    "ND_J":   {"label": "J · комбо-фильтр",          "color": "#22c55e", "width": 2.5},
 }
 
 def _pnl_col(scen):
