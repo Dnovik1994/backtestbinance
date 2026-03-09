@@ -171,7 +171,7 @@ def get_klines_until_close(symbol: str, start_ts_ms: int,
         return pd.DataFrame()
 
     result = pd.concat(all_frames, ignore_index=True)
-    if total_candles > 1500:
+    if total_candles > MAX_DAYS * 24 * 60:
         print(f"    → загружено {total_candles} свечей ({total_candles//1440:.1f} дней)")
     return result
 
