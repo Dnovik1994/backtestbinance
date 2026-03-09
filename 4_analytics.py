@@ -1008,7 +1008,8 @@ def main():
 
 # ── Equity curve ────────────────────────────────────────────────────────────
 
-OUTPUT_HTML = "backtest_equity.html"
+OUTPUT_HTML    = "backtest_equity.html"
+OUTPUT_HTML_ND = "backtest_equity_nd.html"
 INITIAL_BALANCE = 4000.0
 
 SCENARIOS = {
@@ -1021,6 +1022,16 @@ SCENARIOS = {
     "E":   {"label": "E · 48ч",        "color": "#a855f7", "width": 2.0},
 }
 
+ND_SCENARIOS = {
+    "ND_A":   {"label": "A · базовый",    "color": "#3b82f6", "width": 1.5},
+    "ND_B":   {"label": "B · троллинг",   "color": "#f59e0b", "width": 1.5},
+    "ND_C5":  {"label": "C5 · SL-5%",     "color": "#06b6d4", "width": 1.5},
+    "ND_C10": {"label": "C10 · SL-10%",   "color": "#f97316", "width": 1.5},
+    "ND_C15": {"label": "C15 · SL-15%",   "color": "#ef4444", "width": 1.5},
+    "ND_D":   {"label": "D · фикс.стоп",  "color": "#10b981", "width": 2.5},
+    "ND_E":   {"label": "E · 48ч",        "color": "#a855f7", "width": 2.0},
+}
+
 def _pnl_col(scen):
     return f"{scen}_pnl"
 
@@ -1028,26 +1039,21 @@ def _out_col(scen):
     return f"{scen}_outcome"
 
 
-def generate_equity_chart(df: "pd.DataFrame") -> None:
-    try:
-        import plotly.graph_objects as go
-        from plotly.subplots import make_subplots
-    except ImportError:
-        print("⚠️  plotly не установлен — пропускаю equity chart (pip install plotly)")
-        return
-
+def _build_equity_html(df: "pd.DataFrame", scenarios: dict, title: str, output_path: str) -> None:
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
     import pandas as pd
 
     df = df.sort_values("ts").reset_index(drop=True)
     n = len(df)
 
     # --- накопленный баланс и просадка по каждому сценарию ---
-    eq   = {s: [INITIAL_BALANCE] for s in SCENARIOS}
-    peak = {s: INITIAL_BALANCE   for s in SCENARIOS}
-    dd   = {s: [0.0]             for s in SCENARIOS}
+    eq   = {s: [INITIAL_BALANCE] for s in scenarios}
+    peak = {s: INITIAL_BALANCE   for s in scenarios}
+    dd   = {s: [0.0]             for s in scenarios}
 
     for _, row in df.iterrows():
-        for s in SCENARIOS:
+        for s in scenarios:
             col = _pnl_col(s)
             bal = eq[s][-1] + (row[col] if col in df.columns else 0)
             eq[s].append(bal)
@@ -1065,7 +1071,7 @@ def generate_equity_chart(df: "pd.DataFrame") -> None:
 
     # --- итоговые метрики для карточек ---
     stats = {}
-    for s in SCENARIOS:
+    for s in scenarios:
         final  = eq[s][-1]
         profit = final - INITIAL_BALANCE
         pct    = profit / INITIAL_BALANCE * 100
@@ -1076,7 +1082,7 @@ def generate_equity_chart(df: "pd.DataFrame") -> None:
     df["_month"] = pd.to_datetime(df["ts"]).dt.to_period("M").astype(str)
     months = sorted(df["_month"].unique())
     monthly = {}
-    for s in SCENARIOS:
+    for s in scenarios:
         col = _pnl_col(s)
         if col in df.columns:
             monthly[s] = df.groupby("_month")[col].sum().reindex(months, fill_value=0)
@@ -1089,7 +1095,7 @@ def generate_equity_chart(df: "pd.DataFrame") -> None:
         vertical_spacing=0.04,
     )
 
-    for s, cfg in SCENARIOS.items():
+    for s, cfg in scenarios.items():
         visible = True  # все видимы по умолчанию
         # equity
         fig.add_trace(go.Scatter(
@@ -1121,7 +1127,7 @@ def generate_equity_chart(df: "pd.DataFrame") -> None:
                   line_width=1, row=2, col=1)
 
     # --- аннотации итогов (правый край) ---
-    for s, cfg in SCENARIOS.items():
+    for s, cfg in scenarios.items():
         st = stats[s]
         sign = "+" if st["profit"] >= 0 else ""
         fig.add_annotation(
@@ -1135,7 +1141,7 @@ def generate_equity_chart(df: "pd.DataFrame") -> None:
     # ── Layout ──────────────────────────────────────────────────────────────
     fig.update_layout(
         title=dict(
-            text=f"Equity curve · Старт ${INITIAL_BALANCE:,.0f} · {n} сделок",
+            text=f"{title} · Старт ${INITIAL_BALANCE:,.0f} · {n} сделок",
             font=dict(size=16, color="#f1f5f9"),
         ),
         paper_bgcolor="#0f172a",
@@ -1165,7 +1171,7 @@ def generate_equity_chart(df: "pd.DataFrame") -> None:
     card_rows = [
         ["Сценарий", "Итог $", "Прибыль $", "%", "Макс.просадка %"],
     ]
-    for s, cfg in SCENARIOS.items():
+    for s, cfg in scenarios.items():
         st = stats[s]
         sign = "+" if st["profit"] >= 0 else ""
         card_rows.append([
@@ -1187,20 +1193,20 @@ def generate_equity_chart(df: "pd.DataFrame") -> None:
         cells=dict(
             values=list(zip(*card_rows[1:])),
             fill_color=[
-                ["#0f172a"] * len(SCENARIOS),
+                ["#0f172a"] * len(scenarios),
                 [
                     "#166534" if stats[s]["profit"] >= 0 else "#7f1d1d"
-                    for s in SCENARIOS
+                    for s in scenarios
                 ],
                 [
                     "#166534" if stats[s]["profit"] >= 0 else "#7f1d1d"
-                    for s in SCENARIOS
+                    for s in scenarios
                 ],
                 [
                     "#166534" if stats[s]["profit"] >= 0 else "#7f1d1d"
-                    for s in SCENARIOS
+                    for s in scenarios
                 ],
-                ["#1e293b"] * len(SCENARIOS),
+                ["#1e293b"] * len(scenarios),
             ],
             font=dict(color="#e2e8f0", size=11),
             align="left",
@@ -1215,11 +1221,10 @@ def generate_equity_chart(df: "pd.DataFrame") -> None:
 
     # ── Помесячный PnL (bar chart) ───────────────────────────────────────────
     fig_monthly = go.Figure()
-    for s, cfg in SCENARIOS.items():
+    for s, cfg in scenarios.items():
         if s not in monthly:
             continue
         vals = monthly[s].values
-        colors = ["#166534" if v >= 0 else "#7f1d1d" for v in vals]
         fig_monthly.add_trace(go.Bar(
             x=months, y=vals,
             name=cfg["label"],
@@ -1255,7 +1260,7 @@ def generate_equity_chart(df: "pd.DataFrame") -> None:
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<title>Backtest Equity</title>
+<title>{title}</title>
 <style>
   body {{ background:#0f172a; color:#e2e8f0; font-family:system-ui,sans-serif; margin:0; padding:20px; }}
   h1   {{ font-size:18px; color:#f1f5f9; margin-bottom:4px; }}
@@ -1264,7 +1269,7 @@ def generate_equity_chart(df: "pd.DataFrame") -> None:
 </style>
 </head>
 <body>
-<h1>Backtest · Симуляция баланса</h1>
+<h1>{title}</h1>
 <p>Позиция {POSITION_USDT:.0f} USDT фиксированная · x20 · старт ${INITIAL_BALANCE:,.0f}</p>
 <div class="section">{html_equity}</div>
 <div class="section">{html_table}</div>
@@ -1272,10 +1277,27 @@ def generate_equity_chart(df: "pd.DataFrame") -> None:
 </body>
 </html>"""
 
-    with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
+    with open(output_path, "w", encoding="utf-8") as f:
         f.write(html)
 
-    print(f"✅ Equity chart сохранён → {OUTPUT_HTML}")
+    print(f"✅ Equity chart сохранён → {output_path}")
+
+
+def generate_equity_chart(df: "pd.DataFrame") -> None:
+    try:
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+    except ImportError:
+        print("⚠️  plotly не установлен — пропускаю equity chart (pip install plotly)")
+        return
+
+    _build_equity_html(df, SCENARIOS,
+                       title="Equity Chart (с усреднением)",
+                       output_path=OUTPUT_HTML)
+
+    _build_equity_html(df, ND_SCENARIOS,
+                       title="Equity Chart (без усреднения, позиция 250 USDT)",
+                       output_path=OUTPUT_HTML_ND)
 
 
 if __name__ == "__main__":
